@@ -84,6 +84,12 @@ int main(void)
         perror("mkdir " OUT_DIR);
         return EXIT_FAILURE;
     }
+    /* mkdir also says "already exists" when a regular file has that name. */
+    struct stat st;
+    if (stat(OUT_DIR, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        fprintf(stderr, "proc_sensor: " OUT_DIR " exists but is not a directory\n");
+        return EXIT_FAILURE;
+    }
 
     while (1) {
         int processes = count_processes();
