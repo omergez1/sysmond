@@ -1,10 +1,13 @@
 CC = gcc
 CFLAGS = -Wall -g
 
-all: bin/mem_sensor bin/cpu_sensor bin/proc_sensor
+all: bin/sysmond bin/mem_sensor bin/cpu_sensor bin/proc_sensor
 
 bin:
 	mkdir -p bin
+
+bin/sysmond: src/sysmond.c | bin
+	$(CC) $(CFLAGS) src/sysmond.c -o bin/sysmond
 
 bin/mem_sensor: src/mem_sensor.c | bin
 	$(CC) $(CFLAGS) src/mem_sensor.c -o bin/mem_sensor
