@@ -1,6 +1,9 @@
 /*
- * sysmond - central daemon. Every INTERVAL seconds it reads the files the
- * sensors write in /tmp/sysmon/ and prints one combined status report.
+ * sysmond - central daemon. On startup it launches the three sensors as
+ * child processes (fork + exec). Then, every INTERVAL seconds, it reads the
+ * files the sensors write in /tmp/sysmon/ and prints one combined report.
+ * If a sensor dies, sysmond keeps running and reports it as stopped.
+ * On Ctrl+C or kill, it stops all its sensors before exiting.
  *
  * Each sensor file holds lines of the form "Key: value", for example:
  *   MemTotal: 7660516 kB      (mem.dat)
@@ -9,10 +12,15 @@
  */
 
 #include <errno.h>
+#include <limits.h>
+#include <libgen.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -22,6 +30,137 @@
 #define PROC_FILE  DATA_DIR "/proc.dat"
 #define INTERVAL   2                /* seconds between reports */
 #define STALE_AFTER (3 * INTERVAL)  /* data older than this is flagged */
+
+/* ---------- child process management ---------- */
+
+/* One entry per sensor that sysmond launches. */
+struct sensor {
+    const char *name;    /* program name in the same folder as sysmond */
+    pid_t       pid;     /* child PID, or 0 if it was never started */
+    int         alive;   /* 1 while the child is running */
+    int         status;  /* waitpid() status, valid once alive == 0 */
+};
+
+static struct sensor sensors[] = {
+    { "mem_sensor",  0, 0, 0 },
+    { "cpu_sensor",  0, 0, 0 },
+    { "proc_sensor", 0, 0, 0 },
+};
+#define NUM_SENSORS (sizeof(sensors) / sizeof(sensors[0]))
+
+/* Set by the signal handler. "volatile sig_atomic_t" is the only type that
+ * is safe to write from a signal handler and read from normal code. */
+static volatile sig_atomic_t stop_requested = 0;
+
+static void on_stop_signal(int sig)
+{
+    (void)sig;
+    stop_requested = 1;
+}
+
+/* Build the full path of a sensor program. The sensors live in the same
+ * folder as sysmond, so this works no matter which folder you run it from.
+ * /proc/self/exe is a link to the program that is currently running. */
+static int sensor_path(const char *name, char *out, size_t size)
+{
+    char self[PATH_MAX];
+    ssize_t n = readlink("/proc/self/exe", self, sizeof(self) - 1);
+    if (n < 0) {
+        perror("readlink /proc/self/exe");
+        return -1;
+    }
+    self[n] = '\0';
+
+    /* dirname() turns ".../bin/sysmond" into ".../bin" (in place). */
+    int len = snprintf(out, size, "%s/%s", dirname(self), name);
+    if (len < 0 || (size_t)len >= size) {
+        fprintf(stderr, "sysmond: path to %s is too long\n", name);
+        return -1;
+    }
+    return 0;
+}
+
+/* fork() a child for each sensor and exec() the sensor program in it. */
+static void start_sensors(void)
+{
+    for (size_t i = 0; i < NUM_SENSORS; i++) {
+        char path[PATH_MAX];
+        if (sensor_path(sensors[i].name, path, sizeof(path)) != 0)
+            continue;
+
+        /* Flush first, or text still waiting in our stdout buffer would be
+         * copied into the child too. */
+        fflush(stdout);
+
+        pid_t pid = fork();
+        if (pid < 0) {
+            perror("fork");
+            continue;
+        }
+
+        if (pid == 0) {
+            /* Child: replace this process with the sensor program. */
+            char *argv[] = { (char *)sensors[i].name, NULL };
+            execv(path, argv);
+            /* execv only returns if it failed. */
+            perror(path);
+            _exit(127);   /* _exit: don't run the parent's cleanup code */
+        }
+
+        /* Parent: remember the child. */
+        sensors[i].pid = pid;
+        sensors[i].alive = 1;
+        printf("sysmond: started %s (pid %d)\n", sensors[i].name, (int)pid);
+    }
+    fflush(stdout);
+}
+
+/* Collect any sensors that have exited, without blocking. A child that has
+ * exited stays a "zombie" until its parent calls waitpid() on it. */
+static void reap_sensors(void)
+{
+    int status;
+    pid_t pid;
+
+    while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
+        for (size_t i = 0; i < NUM_SENSORS; i++) {
+            if (sensors[i].pid == pid) {
+                sensors[i].alive = 0;
+                sensors[i].status = status;
+            }
+        }
+    }
+}
+
+/* Describe how a child ended, e.g. "exited with code 127". */
+static void describe_exit(int status, char *out, size_t size)
+{
+    if (WIFEXITED(status))
+        snprintf(out, size, "exited with code %d", WEXITSTATUS(status));
+    else if (WIFSIGNALED(status))
+        snprintf(out, size, "killed by signal %d (%s)",
+                 WTERMSIG(status), strsignal(WTERMSIG(status)));
+    else
+        snprintf(out, size, "stopped");
+}
+
+/* Ask every running sensor to stop, then wait for each one so none is
+ * left behind as an orphan or a zombie. */
+static void stop_sensors(void)
+{
+    for (size_t i = 0; i < NUM_SENSORS; i++) {
+        if (sensors[i].alive)
+            kill(sensors[i].pid, SIGTERM);
+    }
+    for (size_t i = 0; i < NUM_SENSORS; i++) {
+        if (sensors[i].alive) {
+            waitpid(sensors[i].pid, NULL, 0);
+            sensors[i].alive = 0;
+        }
+    }
+}
+
+/* ---------- reading and printing sensor data ---------- */
 
 /* The contents of one sensor file, read in a single pass. */
 struct sensor_file {
@@ -77,16 +216,38 @@ static int get_value(const struct sensor_file *f, const char *key, double *out)
     return 0;
 }
 
-/* Print a section heading, with a warning if the data is missing or old. */
+/* Find a sensor in the table by name, or NULL. */
+static const struct sensor *find_sensor(const char *name)
+{
+    for (size_t i = 0; i < NUM_SENSORS; i++) {
+        if (strcmp(sensors[i].name, name) == 0)
+            return &sensors[i];
+    }
+    return NULL;
+}
+
+/* Print a section heading, with a warning if the sensor has died or the
+ * data is missing or old. */
 static void print_heading(const char *title, const struct sensor_file *f,
                           const char *sensor)
 {
     printf("%s\n", title);
-    if (!f->found)
+
+    const struct sensor *s = find_sensor(sensor);
+    if (s != NULL && s->pid != 0 && !s->alive) {
+        char how[96];
+        describe_exit(s->status, how, sizeof(how));
+        if (f->found)
+            printf("  (SENSOR DOWN: %s %s - last data from %lds ago)\n",
+                   sensor, how, (long)f->age);
+        else
+            printf("  (SENSOR DOWN: %s %s - no data)\n", sensor, how);
+    } else if (!f->found) {
         printf("  (no data - is %s running?)\n", sensor);
-    else if (f->age > STALE_AFTER)
+    } else if (f->age > STALE_AFTER) {
         printf("  (STALE: last update %lds ago - is %s still running?)\n",
                (long)f->age, sensor);
+    }
 }
 
 static double kb_to_mb(double kb)
@@ -192,10 +353,27 @@ int main(void)
         return EXIT_FAILURE;
     }
 
-    while (1) {
+    /* Ctrl+C sends SIGINT, "kill" sends SIGTERM. Instead of dying right
+     * away, set a flag so the loop below ends and we can stop the sensors. */
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = on_stop_signal;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+
+    start_sensors();
+    sleep(1);   /* give the sensors a moment to write their first sample */
+
+    /* A signal wakes sleep() early, so Ctrl+C is handled right away. */
+    while (!stop_requested) {
+        reap_sensors();
         print_report();
         sleep(INTERVAL);
     }
 
+    printf("sysmond: stopping sensors...\n");
+    stop_sensors();
+    printf("sysmond: done\n");
     return EXIT_SUCCESS;
 }
