@@ -32,24 +32,22 @@ make clean    # removes the built programs
 
 ## Running
 
-Start the sensors in the background, then run the daemon:
+Run the daemon. It starts the three sensors itself:
 
 ```bash
-./bin/mem_sensor &
-./bin/cpu_sensor &
-./bin/proc_sensor &
-./bin/sysmond          # Ctrl+C to stop
+./bin/sysmond          # Ctrl+C stops sysmond and all its sensors
 ```
 
-Stop the sensors when you're done:
+`sysmond` launches each sensor as a child process with `fork()` + `execv()`. It looks for the sensor programs in the same folder as its own program, so it works from any working directory. On Ctrl+C (`SIGINT`) or `kill` (`SIGTERM`), it stops every sensor and waits for each one, so no processes are left behind.
 
-```bash
-pkill -x mem_sensor; pkill -x cpu_sensor; pkill -x proc_sensor
-```
+The sensors can still be run on their own for testing, e.g. `./bin/cpu_sensor &`.
 
 Example report:
 
 ```
+sysmond: started mem_sensor (pid 5473)
+sysmond: started cpu_sensor (pid 5474)
+sysmond: started proc_sensor (pid 5475)
 ========== sysmon report 2026-11-14 16:44:56 ==========
 Memory
   Total:        7481.0 MB
@@ -86,6 +84,7 @@ The sensors write to a temporary file (`*.dat.tmp`) and then `rename()` it over 
 
 | Situation                                   | What the report shows                       |
 |---------------------------------------------|---------------------------------------------|
+| A sensor process died or failed to start    | `(SENSOR DOWN: X killed by signal 9 ...)`   |
 | A sensor hasn't written its file yet        | `(no data - is X running?)`                 |
 | A file hasn't been updated for over 6 s     | `(STALE: last update Ns ago - ...)`         |
 | A file's contents can't be parsed           | `(could not parse /tmp/sysmon/X.dat)`       |
