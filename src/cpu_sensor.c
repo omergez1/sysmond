@@ -1,19 +1,15 @@
 /*
- * cpu_sensor - reads the 1, 5 and 15 minute load averages from
- * /proc/loadavg and writes them to /tmp/sysmon/cpu.dat every INTERVAL seconds.
+ * cpu_sensor - thread that reads the 1, 5 and 15 minute load averages from
+ * /proc/loadavg and stores them in the shared state every SAMPLE_INTERVAL
+ * seconds. When load1 rises above ALERT_LOAD_THRESHOLD it wakes the alert
+ * thread, once per spike.
  */
 
-#include <errno.h>
 #include <stdio.h>
-#include <stdlib.h>
-#include <sys/stat.h>
-#include <unistd.h>
+
+#include <sysmon.h>
 
 #define LOADAVG_PATH "/proc/loadavg"
-#define OUT_DIR      "/tmp/sysmon"
-#define OUT_FILE     OUT_DIR "/cpu.dat"
-#define TMP_FILE     OUT_DIR "/cpu.dat.tmp"
-#define INTERVAL     2   /* seconds between samples */
 
 struct cpu_stats {
     double load1;
@@ -47,53 +43,37 @@ static int read_loadavg(struct cpu_stats *stats)
     return 0;
 }
 
-/* Write the stats to a temp file, then rename it over cpu.dat.
- * rename() is atomic, so sysmond never reads a half-written file. */
-static int write_stats(const struct cpu_stats *stats)
+void *cpu_sensor_thread(void *arg)
 {
-    FILE *fp = fopen(TMP_FILE, "w");
-    if (fp == NULL) {
-        perror("fopen " TMP_FILE);
-        return -1;
-    }
-
-    fprintf(fp, "Load1: %.2f\n", stats->load1);
-    fprintf(fp, "Load5: %.2f\n", stats->load5);
-    fprintf(fp, "Load15: %.2f\n", stats->load15);
-
-    if (fclose(fp) != 0) {
-        perror("fclose " TMP_FILE);
-        return -1;
-    }
-
-    if (rename(TMP_FILE, OUT_FILE) != 0) {
-        perror("rename " TMP_FILE);
-        return -1;
-    }
-    return 0;
-}
-
-int main(void)
-{
-    /* The sensor may start before sysmond, so make sure the directory exists. */
-    if (mkdir(OUT_DIR, 0755) != 0 && errno != EEXIST) {
-        perror("mkdir " OUT_DIR);
-        return EXIT_FAILURE;
-    }
-    /* mkdir also says "already exists" when a regular file has that name. */
-    struct stat st;
-    if (stat(OUT_DIR, &st) != 0 || !S_ISDIR(st.st_mode)) {
-        fprintf(stderr, "cpu_sensor: " OUT_DIR " exists but is not a directory\n");
-        return EXIT_FAILURE;
-    }
-
+    sysmon_set_thread_name((const char *)arg);
     struct cpu_stats stats;
 
-    while (1) {
-        if (read_loadavg(&stats) == 0)
-            write_stats(&stats);
-        sleep(INTERVAL);
-    }
+    /* 1 while load1 is above the threshold. Used to alert only when the
+     * load crosses the threshold, not on every sample while it stays high.
+     * Only this thread uses it, so it needs no lock. */
+    int above = 0;
 
-    return EXIT_SUCCESS;
+    while (sysmon_running()) {
+        if (read_loadavg(&stats) == 0) {
+            pthread_mutex_lock(&g_state.lock);
+            g_state.load1    = stats.load1;
+            g_state.load5    = stats.load5;
+            g_state.load15   = stats.load15;
+            g_state.have_cpu = 1;
+
+            if (stats.load1 > ALERT_LOAD_THRESHOLD) {
+                if (!above) {
+                    above = 1;
+                    g_state.alert_pending   = 1;
+                    g_state.last_alert_load = stats.load1;
+                    pthread_cond_signal(&g_state.alert_cond);
+                }
+            } else {
+                above = 0;   /* back to normal: the next spike alerts again */
+            }
+            pthread_mutex_unlock(&g_state.lock);
+        }
+        sysmon_sleep(SAMPLE_INTERVAL);
+    }
+    return NULL;
 }

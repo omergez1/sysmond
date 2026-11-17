@@ -1,27 +1,21 @@
 /*
- * mem_sensor - reads memory metrics from /proc/meminfo and writes them
- * to /tmp/sysmon/mem.dat every INTERVAL seconds.
+ * mem_sensor - thread that reads memory metrics from /proc/meminfo and
+ * stores them in the shared state every SAMPLE_INTERVAL seconds.
  */
 
-#include <errno.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
-#include <unistd.h>
+
+#include <sysmon.h>
 
 #define MEMINFO_PATH "/proc/meminfo"
-#define OUT_DIR      "/tmp/sysmon"
-#define OUT_FILE     OUT_DIR "/mem.dat"
-#define TMP_FILE     OUT_DIR "/mem.dat.tmp"
-#define INTERVAL     2   /* seconds between samples */
 
 struct mem_stats {
-    unsigned long mem_total;
-    unsigned long mem_free;
-    unsigned long mem_available;
-    unsigned long swap_total;
-    unsigned long swap_free;
+    long mem_total;
+    long mem_free;
+    long mem_available;
+    long swap_total;
+    long swap_free;
 };
 
 /* Read /proc/meminfo and fill in the fields we care about (values in kB).
@@ -38,12 +32,12 @@ static int read_meminfo(struct mem_stats *stats)
 
     char line[256];
     char key[64];
-    unsigned long value;
+    long value;
     int found = 0;
 
     while (fgets(line, sizeof(line), fp) != NULL) {
         /* Each line looks like: "MemTotal:       16318412 kB" */
-        if (sscanf(line, "%63[^:]: %lu", key, &value) != 2)
+        if (sscanf(line, "%63[^:]: %ld", key, &value) != 2)
             continue;
 
         if (strcmp(key, "MemTotal") == 0) {
@@ -73,55 +67,25 @@ static int read_meminfo(struct mem_stats *stats)
     return 0;
 }
 
-/* Write the stats to a temp file, then rename it over mem.dat.
- * rename() is atomic, so sysmond never reads a half-written file. */
-static int write_stats(const struct mem_stats *stats)
+void *mem_sensor_thread(void *arg)
 {
-    FILE *fp = fopen(TMP_FILE, "w");
-    if (fp == NULL) {
-        perror("fopen " TMP_FILE);
-        return -1;
-    }
-
-    fprintf(fp, "MemTotal: %lu kB\n", stats->mem_total);
-    fprintf(fp, "MemFree: %lu kB\n", stats->mem_free);
-    fprintf(fp, "MemAvailable: %lu kB\n", stats->mem_available);
-    fprintf(fp, "SwapTotal: %lu kB\n", stats->swap_total);
-    fprintf(fp, "SwapFree: %lu kB\n", stats->swap_free);
-
-    if (fclose(fp) != 0) {
-        perror("fclose " TMP_FILE);
-        return -1;
-    }
-
-    if (rename(TMP_FILE, OUT_FILE) != 0) {
-        perror("rename " TMP_FILE);
-        return -1;
-    }
-    return 0;
-}
-
-int main(void)
-{
-    /* The sensor may start before sysmond, so make sure the directory exists. */
-    if (mkdir(OUT_DIR, 0755) != 0 && errno != EEXIST) {
-        perror("mkdir " OUT_DIR);
-        return EXIT_FAILURE;
-    }
-    /* mkdir also says "already exists" when a regular file has that name. */
-    struct stat st;
-    if (stat(OUT_DIR, &st) != 0 || !S_ISDIR(st.st_mode)) {
-        fprintf(stderr, "mem_sensor: " OUT_DIR " exists but is not a directory\n");
-        return EXIT_FAILURE;
-    }
-
+    sysmon_set_thread_name((const char *)arg);
     struct mem_stats stats;
 
-    while (1) {
-        if (read_meminfo(&stats) == 0)
-            write_stats(&stats);
-        sleep(INTERVAL);
+    while (sysmon_running()) {
+        /* Read /proc outside the lock so other threads aren't kept waiting
+         * while we do file I/O. Only the copy into g_state is locked. */
+        if (read_meminfo(&stats) == 0) {
+            pthread_mutex_lock(&g_state.lock);
+            g_state.mem_total  = stats.mem_total;
+            g_state.mem_free   = stats.mem_free;
+            g_state.mem_avail  = stats.mem_available;
+            g_state.swap_total = stats.swap_total;
+            g_state.swap_free  = stats.swap_free;
+            g_state.have_mem   = 1;
+            pthread_mutex_unlock(&g_state.lock);
+        }
+        sysmon_sleep(SAMPLE_INTERVAL);
     }
-
-    return EXIT_SUCCESS;
+    return NULL;
 }
