@@ -1,22 +1,25 @@
-CC = gcc
-CFLAGS = -Wall -g
+CC      = gcc
+CFLAGS  = -Wall -g -Iinc -pthread
+LDFLAGS = -pthread
 
-all: bin/sysmond bin/mem_sensor bin/cpu_sensor bin/proc_sensor
+SRCS = src/sysmond.c src/mem_sensor.c src/cpu_sensor.c src/proc_sensor.c src/alert.c
+OBJS = $(SRCS:src/%.c=obj/%.o)
 
-bin:
-	mkdir -p bin
+all: bin/sysmond
 
-bin/sysmond: src/sysmond.c | bin
-	$(CC) $(CFLAGS) src/sysmond.c -o bin/sysmond
+bin obj:
+	mkdir -p $@
 
-bin/mem_sensor: src/mem_sensor.c | bin
-	$(CC) $(CFLAGS) src/mem_sensor.c -o bin/mem_sensor
+# Link all object files into the single sysmond program.
+bin/sysmond: $(OBJS) | bin
+	$(CC) $(LDFLAGS) $(OBJS) -o $@
 
-bin/cpu_sensor: src/cpu_sensor.c | bin
-	$(CC) $(CFLAGS) src/cpu_sensor.c -o bin/cpu_sensor
-
-bin/proc_sensor: src/proc_sensor.c | bin
-	$(CC) $(CFLAGS) src/proc_sensor.c -o bin/proc_sensor
+# Compile each .c into a .o. Every file includes sysmon.h, so a change to
+# the header rebuilds everything.
+obj/%.o: src/%.c inc/sysmon.h | obj
+	$(CC) $(CFLAGS) -c $< -o $@
 
 clean:
-	rm -f bin/*
+	rm -rf bin/* obj
+
+.PHONY: all clean
