@@ -1,105 +1,122 @@
 # sysmon
 
-A small Linux system monitor written in C. Three sensor processes collect memory, CPU load and process statistics from `/proc`, and a central daemon, `sysmond`, combines them into one status report printed to the terminal.
+A small Linux system monitor written in C. `sysmond` samples memory, CPU load and process statistics from `/proc` and prints a live status report in the terminal. If the CPU load spikes, it prints an alert.
 
-This is Phase 1 of a course project. The sensors and the daemon are separate programs that communicate through text files. Later phases replace the files with IPC and move to a multi-threaded design. See [sysmond-phase-1-guide.md](sysmond-phase-1-guide.md) for the full assignment.
+This is a course project built in phases:
+
+| Version | Phase | Design |
+|---------|-------|--------|
+| **v2.0** (current) | 2 | One multi-threaded program. Threads share an in-memory struct protected by a mutex, and a condition variable wakes the alert thread. See [sysmond-phase-2-guide.md](sysmond-phase-2-guide.md). |
+| v1.0 | 1 | Separate sensor processes write `/tmp/sysmon/*.dat` files, and `sysmond` starts them with `fork` + `exec` and reads the files. See [sysmond-phase-1-guide.md](sysmond-phase-1-guide.md). |
+
+To look at or build v1.0: `git checkout v1.0` (return with `git switch main`).
 
 ## How it works
 
 ```
-/proc/meminfo  ──>  mem_sensor   ──>  /tmp/sysmon/mem.dat  ──┐
-/proc/loadavg  ──>  cpu_sensor   ──>  /tmp/sysmon/cpu.dat  ──┼──>  sysmond  ──>  terminal
-/proc/<pid>/   ──>  proc_sensor  ──>  /tmp/sysmon/proc.dat ──┘
+                       sysmond (one process)
+  ┌──────────────────────────────────────────────────────────────┐
+  │  mem_sensor  ──┐  lock, update, unlock                       │
+  │  cpu_sensor  ──┼──────────────────────>  SystemState g_state │
+  │  proc_sensor ──┘                         (mutex: lock)       │
+  │       │                                        │             │
+  │       │ load1 > 1.50: pthread_cond_signal      │ lock, copy, │
+  │       v                                        │ unlock      │
+  │  alert ── waits on alert_cond,                 v             │
+  │           prints alert to stderr          main thread:       │
+  │                                           redraws the report │
+  │                                           every 2 s          │
+  └──────────────────────────────────────────────────────────────┘
 ```
 
-| Program       | Reads                                 | Writes                 |
-|---------------|---------------------------------------|------------------------|
-| `mem_sensor`  | `/proc/meminfo`                       | `/tmp/sysmon/mem.dat`  |
-| `cpu_sensor`  | `/proc/loadavg`                       | `/tmp/sysmon/cpu.dat`  |
-| `proc_sensor` | `/proc` (counts numeric PID folders)  | `/tmp/sysmon/proc.dat` |
-| `sysmond`     | the three `.dat` files                | report to stdout       |
+| Thread        | Job |
+|---------------|-----|
+| `mem_sensor`  | Reads `/proc/meminfo` (MemTotal, MemFree, MemAvailable, SwapTotal, SwapFree) |
+| `cpu_sensor`  | Reads `/proc/loadavg` (1, 5 and 15 minute load). Signals `alert` when the 1-minute load goes above 1.50 |
+| `proc_sensor` | Counts the numeric folders in `/proc` (one per running process) |
+| `alert`       | Sleeps in `pthread_cond_wait` until signaled, then prints an alert to stderr |
+| main          | Starts the threads, redraws the report every 2 s, and shuts everything down on Ctrl+C |
 
-Every program runs in a loop with a 2-second interval, set by `INTERVAL` at the top of each source file. Each program creates `/tmp/sysmon` if it doesn't exist, so they can be started in any order.
+**Thread-safety rules used throughout:**
+- Every read or write of `g_state` happens between `pthread_mutex_lock` and `pthread_mutex_unlock`.
+- Slow work, like reading `/proc` or printing, happens *outside* the lock. Sensors read into local variables and then lock only to copy the values in. The main thread copies a snapshot under the lock and prints after unlocking.
+- `pthread_cond_wait` is always called in a loop that checks a flag (`alert_pending`). This protects against wakeups with no signal ("spurious wakeups") and against signals sent before the thread started waiting.
+- SIGINT and SIGTERM are blocked in every thread and collected only by the main thread with `sigtimedwait`, so a signal never interrupts a worker at a random point.
+
+**Alerts happen once per spike:** an alert fires when the 1-minute load *crosses* above 1.50. It fires again only after the load drops back to 1.50 or below and then rises again. While the load is high, the report also shows a red `HIGH LOAD` line.
 
 ## Building
 
 Requires `gcc` and `make` on Linux.
 
 ```bash
-make          # builds all four programs into bin/
-make clean    # removes the built programs
+make          # builds bin/sysmond (object files go in obj/)
+make clean    # removes bin/ contents and obj/
+```
+
+The alert threshold can be changed when building, for example to test the alert without creating CPU load:
+```bash
+gcc -Wall -g -Iinc -pthread -DALERT_LOAD_THRESHOLD=0.0 src/*.c -o bin/sysmond_test
 ```
 
 ## Running
 
-Run the daemon. It starts the three sensors itself:
-
 ```bash
-./bin/sysmond          # Ctrl+C stops sysmond and all its sensors
+./bin/sysmond          # Ctrl+C to stop
 ```
 
-`sysmond` launches each sensor as a child process with `fork()` + `execv()`. It looks for the sensor programs in the same folder as its own program, so it works from any working directory. On Ctrl+C (`SIGINT`) or `kill` (`SIGTERM`), it stops every sensor and waits for each one, so no processes are left behind.
-
-The sensors can still be run on their own for testing, e.g. `./bin/cpu_sensor &`.
-
-Example report:
+In a terminal, the screen is redrawn in place with colors. When the output goes to a file or a pipe, it's plain text with no color codes.
 
 ```
-sysmond: started mem_sensor (pid 5473)
-sysmond: started cpu_sensor (pid 5474)
-sysmond: started proc_sensor (pid 5475)
-========== sysmon report 2026-11-14 16:44:56 ==========
+========== sysmon v2.0 report 2026-11-17 20:18:11 ==========
 Memory
   Total:        7481.0 MB
-  Used:         2806.9 MB (37.5%)
-  Free:         3276.1 MB
-  Available:    4674.1 MB
-  Swap:            0.0 / 4916.0 MB used (0.0%)
+  Used:         3607.1 MB (48.2%)
+  Free:         1179.2 MB
+  Available:    3873.9 MB
+  Swap:          262.5 / 4916.0 MB used (5.3%)
 CPU load
-  1 min: 0.64   5 min: 0.65   15 min: 0.34
+  1 min: 1.84   5 min: 0.87   15 min: 0.54
+  HIGH LOAD: 1-min load is above 1.50
 Processes
-  Running: 360
+  Running: 364
+Alerts
+  Last alert: 20:18:52 (load 1.84)
 ```
 
-"Used" memory is `MemTotal - MemAvailable`, the same way `free` calculates it.
-
-## Data file format
-
-Each `.dat` file contains one `Key: value` pair per line:
-
+The alert itself goes to stderr:
 ```
-# mem.dat (values in kB)          # cpu.dat         # proc.dat
-MemTotal: 7660516 kB              Load1: 0.61       Processes: 360
-MemFree: 2766552 kB               Load5: 0.38
-MemAvailable: 4673020 kB          Load15: 0.24
-SwapTotal: 5033980 kB
-SwapFree: 5033980 kB
+*** ALERT 20:18:52: high CPU load 1.84 (threshold 1.50) ***
 ```
 
-The sensors write to a temporary file (`*.dat.tmp`) and then `rename()` it over the real file. Because the rename happens in one step, `sysmond` never reads a half-written file.
-
-## Error handling
-
-`sysmond` keeps running when data is missing or bad, and labels the affected section:
-
-| Situation                                   | What the report shows                       |
-|---------------------------------------------|---------------------------------------------|
-| A sensor process died or failed to start    | `(SENSOR DOWN: X killed by signal 9 ...)`   |
-| A sensor hasn't written its file yet        | `(no data - is X running?)`                 |
-| A file hasn't been updated for over 6 s     | `(STALE: last update Ns ago - ...)`         |
-| A file's contents can't be parsed           | `(could not parse /tmp/sysmon/X.dat)`       |
-
-If `/tmp/sysmon` exists but is a regular file, every program exits with an error message.
+To trigger it with real load, run a few busy loops for a minute, then stop them:
+```bash
+for i in 1 2 3 4; do yes > /dev/null & done     # wait ~30-60 s for the 1-min load to rise
+kill %1 %2 %3 %4
+```
 
 ## Checking that it works
 
 ```bash
-cat /tmp/sysmon/*.dat                 # see the raw sensor output
-watch -n 1 'cat /tmp/sysmon/*.dat'    # watch it update every 2 seconds
-cat /proc/loadavg                     # compare with cpu.dat
-free -m                               # compare with the Memory section
-ls /proc | grep -c '^[0-9]*$'         # compare with the Processes count
+ps -T -p $(pgrep -x sysmond)    # 5 threads: sysmond, mem_sensor, cpu_sensor, proc_sensor, alert
+free -m                         # compare with the Memory section
+cat /proc/loadavg               # compare with CPU load
+ls /proc | grep -c '^[0-9]*$'   # compare with Processes
+valgrind --tool=helgrind ./bin/sysmond   # checks for data races (Ctrl+C to stop)
 ```
+
+## v1 vs v2
+
+Both versions measured on the same machine at the same time:
+
+| | v1.0 (processes + files) | v2.0 (threads + shared memory) |
+|---|---|---|
+| Processes | 4 | 1 (5 threads) |
+| Memory (RSS) | 6.7 MB total | 1.8 MB |
+| System calls in 20 s | 718 | 347 |
+| CPU time per minute | ~0.01 s | ~0.01 s |
+| Files written | 3 `.dat` files every 2 s | none |
+| A sensor can crash alone | yes | no (a crash takes the whole program down) |
 
 ## Project layout
 
@@ -107,11 +124,16 @@ ls /proc | grep -c '^[0-9]*$'         # compare with the Processes count
 .
 ├── Makefile
 ├── README.md
-├── sysmond-phase-1-guide.md   # assignment description
+├── sysmond-phase-1-guide.md
+├── sysmond-phase-2-guide.md
+├── inc/
+│   └── sysmon.h        # SystemState, shared declarations, version, threshold
 ├── src/
-│   ├── sysmond.c              # daemon: reads .dat files, prints the report
-│   ├── mem_sensor.c
-│   ├── cpu_sensor.c
-│   └── proc_sensor.c
-└── bin/                       # build output (not tracked by git)
+│   ├── sysmond.c       # main thread: setup, report, shutdown
+│   ├── mem_sensor.c    # mem_sensor_thread
+│   ├── cpu_sensor.c    # cpu_sensor_thread + alert trigger
+│   ├── proc_sensor.c   # proc_sensor_thread
+│   └── alert.c         # alert_thread
+├── obj/                # compiled .o files (not tracked by git)
+└── bin/                # sysmond (not tracked by git)
 ```
