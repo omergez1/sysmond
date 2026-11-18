@@ -85,12 +85,12 @@ In a terminal the screen redraws in place with color. Redirected to a file, it's
 In a second terminal while `sysmond` runs:
 
 ```bash
-ps -ef | grep sysmond/bin/                 # sysmond + 3 sensors; sensors' PPID = sysmond's PID
+ps -f -C sysmond,mem_sensor,cpu_sensor,proc_sensor   # sysmond + 3 sensors; sensors' PPID = sysmond's PID
 ls -l /tmp/sysmon_*.fifo                   # type 'p' = named pipe
 ls -l /proc/$(pgrep -x cpu_sensor)/fd      # only 0, 1, 2 and its own FIFO
 ```
 
-The guide's `ps -ef | grep bin/` also works, but it matches every program in `/usr/bin` as well. `grep sysmond/bin/` shows only this project.
+`ps -C` selects processes by program name, so it finds `sysmond` however it was started. The guide's `ps -ef | grep bin/` also works, but it matches every program in `/usr/bin` too. Add `| grep -v -e grep -e /usr/` to hide those.
 
 After Ctrl+C, the same commands should show no sensors and no FIFO files.
 
