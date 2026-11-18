@@ -1,22 +1,21 @@
 /*
- * proc_sensor - counts running processes by scanning /proc for numeric
- * directory names (one per PID) and writes the count to /tmp/sysmon/proc.dat
- * every INTERVAL seconds.
+ * proc_sensor - counts running processes (numeric directories in /proc, one
+ * per PID) every SAMPLE_INTERVAL seconds and writes the count as a binary
+ * ProcData struct to the named pipe PROC_FIFO_PATH, which sysmond creates
+ * and reads.
  */
 
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <sys/stat.h>
 #include <unistd.h>
 
+#include <sysmon_ipc.h>
+
 #define PROC_PATH "/proc"
-#define OUT_DIR   "/tmp/sysmon"
-#define OUT_FILE  OUT_DIR "/proc.dat"
-#define TMP_FILE  OUT_DIR "/proc.dat.tmp"
-#define INTERVAL  2   /* seconds between samples */
 
 /* Return 1 if the string is made only of digits (like "1234"), else 0. */
 static int is_number(const char *s)
@@ -53,50 +52,45 @@ static int count_processes(void)
     return count;
 }
 
-/* Write the count to a temp file, then rename it over proc.dat.
- * rename() is atomic, so sysmond never reads a half-written file. */
-static int write_stats(int processes)
+/* Write all len bytes, retrying on partial writes and EINTR.
+ * Returns 0 on success, -1 on error. */
+static int write_full(int fd, const void *buf, size_t len)
 {
-    FILE *fp = fopen(TMP_FILE, "w");
-    if (fp == NULL) {
-        perror("fopen " TMP_FILE);
-        return -1;
-    }
-
-    fprintf(fp, "Processes: %d\n", processes);
-
-    if (fclose(fp) != 0) {
-        perror("fclose " TMP_FILE);
-        return -1;
-    }
-
-    if (rename(TMP_FILE, OUT_FILE) != 0) {
-        perror("rename " TMP_FILE);
-        return -1;
+    const char *p = buf;
+    while (len > 0) {
+        ssize_t n = write(fd, p, len);
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
+            return -1;
+        }
+        p += n;
+        len -= (size_t)n;
     }
     return 0;
 }
 
 int main(void)
 {
-    /* The sensor may start before sysmond, so make sure the directory exists. */
-    if (mkdir(OUT_DIR, 0755) != 0 && errno != EEXIST) {
-        perror("mkdir " OUT_DIR);
-        return EXIT_FAILURE;
-    }
-    /* mkdir also says "already exists" when a regular file has that name. */
-    struct stat st;
-    if (stat(OUT_DIR, &st) != 0 || !S_ISDIR(st.st_mode)) {
-        fprintf(stderr, "proc_sensor: " OUT_DIR " exists but is not a directory\n");
+    /* Waits until sysmond opens the FIFO for reading. No O_CREAT: if the
+     * FIFO doesn't exist, fail instead of creating a regular file. */
+    int fd = open(PROC_FIFO_PATH, O_WRONLY);
+    if (fd < 0) {
+        perror("proc_sensor: open " PROC_FIFO_PATH);
         return EXIT_FAILURE;
     }
 
+    ProcData data;
     while (1) {
-        int processes = count_processes();
-        if (processes >= 0)
-            write_stats(processes);
-        sleep(INTERVAL);
+        data.total_procs = count_processes();
+        if (data.total_procs >= 0) {
+            /* No reader left (sysmond exited) -> SIGPIPE ends this process. */
+            if (write_full(fd, &data, sizeof(data)) != 0) {
+                perror("proc_sensor: write");
+                close(fd);
+                return EXIT_FAILURE;
+            }
+        }
+        sleep(SAMPLE_INTERVAL);
     }
-
-    return EXIT_SUCCESS;
 }

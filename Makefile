@@ -1,22 +1,19 @@
-CC = gcc
-CFLAGS = -Wall -g
+CC     = gcc
+CFLAGS = -Wall -g -Iinc
 
-all: bin/sysmond bin/mem_sensor bin/cpu_sensor bin/proc_sensor
+BINS = bin/sysmond bin/mem_sensor bin/cpu_sensor bin/proc_sensor
+
+all: $(BINS)
 
 bin:
-	mkdir -p bin
+	mkdir -p $@
 
-bin/sysmond: src/sysmond.c | bin
-	$(CC) $(CFLAGS) src/sysmond.c -o bin/sysmond
-
-bin/mem_sensor: src/mem_sensor.c | bin
-	$(CC) $(CFLAGS) src/mem_sensor.c -o bin/mem_sensor
-
-bin/cpu_sensor: src/cpu_sensor.c | bin
-	$(CC) $(CFLAGS) src/cpu_sensor.c -o bin/cpu_sensor
-
-bin/proc_sensor: src/proc_sensor.c | bin
-	$(CC) $(CFLAGS) src/proc_sensor.c -o bin/proc_sensor
+# Each program is built from one .c file. All of them include
+# sysmon_ipc.h, so changing the header rebuilds all four.
+bin/%: src/%.c inc/sysmon_ipc.h | bin
+	$(CC) $(CFLAGS) $< -o $@
 
 clean:
 	rm -f bin/*
+
+.PHONY: all clean

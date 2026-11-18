@@ -1,31 +1,24 @@
 /*
- * cpu_sensor - reads the 1, 5 and 15 minute load averages from
- * /proc/loadavg and writes them to /tmp/sysmon/cpu.dat every INTERVAL seconds.
+ * cpu_sensor - reads the 1, 5 and 15 minute load averages from /proc/loadavg
+ * every SAMPLE_INTERVAL seconds and writes them as a binary CpuData struct
+ * to the named pipe CPU_FIFO_PATH, which sysmond creates and reads.
  */
 
 #include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <sys/stat.h>
 #include <unistd.h>
 
-#define LOADAVG_PATH "/proc/loadavg"
-#define OUT_DIR      "/tmp/sysmon"
-#define OUT_FILE     OUT_DIR "/cpu.dat"
-#define TMP_FILE     OUT_DIR "/cpu.dat.tmp"
-#define INTERVAL     2   /* seconds between samples */
+#include <sysmon_ipc.h>
 
-struct cpu_stats {
-    double load1;
-    double load5;
-    double load15;
-};
+#define LOADAVG_PATH "/proc/loadavg"
 
 /* Read /proc/loadavg. Its single line looks like:
  *   "0.40 0.28 0.20 3/1092 5850"
  * The first three numbers are the 1, 5 and 15 minute load averages.
  * Returns 0 on success, -1 on failure. */
-static int read_loadavg(struct cpu_stats *stats)
+static int read_loadavg(CpuData *data)
 {
     FILE *fp = fopen(LOADAVG_PATH, "r");
     if (fp == NULL) {
@@ -36,7 +29,7 @@ static int read_loadavg(struct cpu_stats *stats)
     char line[128];
     int ok = fgets(line, sizeof(line), fp) != NULL &&
              sscanf(line, "%lf %lf %lf",
-                    &stats->load1, &stats->load5, &stats->load15) == 3;
+                    &data->load1, &data->load5, &data->load15) == 3;
 
     fclose(fp);
 
@@ -47,53 +40,45 @@ static int read_loadavg(struct cpu_stats *stats)
     return 0;
 }
 
-/* Write the stats to a temp file, then rename it over cpu.dat.
- * rename() is atomic, so sysmond never reads a half-written file. */
-static int write_stats(const struct cpu_stats *stats)
+/* Write all len bytes, retrying on partial writes and EINTR.
+ * Returns 0 on success, -1 on error. */
+static int write_full(int fd, const void *buf, size_t len)
 {
-    FILE *fp = fopen(TMP_FILE, "w");
-    if (fp == NULL) {
-        perror("fopen " TMP_FILE);
-        return -1;
-    }
-
-    fprintf(fp, "Load1: %.2f\n", stats->load1);
-    fprintf(fp, "Load5: %.2f\n", stats->load5);
-    fprintf(fp, "Load15: %.2f\n", stats->load15);
-
-    if (fclose(fp) != 0) {
-        perror("fclose " TMP_FILE);
-        return -1;
-    }
-
-    if (rename(TMP_FILE, OUT_FILE) != 0) {
-        perror("rename " TMP_FILE);
-        return -1;
+    const char *p = buf;
+    while (len > 0) {
+        ssize_t n = write(fd, p, len);
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
+            return -1;
+        }
+        p += n;
+        len -= (size_t)n;
     }
     return 0;
 }
 
 int main(void)
 {
-    /* The sensor may start before sysmond, so make sure the directory exists. */
-    if (mkdir(OUT_DIR, 0755) != 0 && errno != EEXIST) {
-        perror("mkdir " OUT_DIR);
-        return EXIT_FAILURE;
-    }
-    /* mkdir also says "already exists" when a regular file has that name. */
-    struct stat st;
-    if (stat(OUT_DIR, &st) != 0 || !S_ISDIR(st.st_mode)) {
-        fprintf(stderr, "cpu_sensor: " OUT_DIR " exists but is not a directory\n");
+    /* Opening a FIFO for writing waits until someone opens it for reading
+     * (sysmond does, right after starting the sensors). No O_CREAT: if the
+     * FIFO doesn't exist, fail instead of creating a regular file. */
+    int fd = open(CPU_FIFO_PATH, O_WRONLY);
+    if (fd < 0) {
+        perror("cpu_sensor: open " CPU_FIFO_PATH);
         return EXIT_FAILURE;
     }
 
-    struct cpu_stats stats;
-
+    CpuData data;
     while (1) {
-        if (read_loadavg(&stats) == 0)
-            write_stats(&stats);
-        sleep(INTERVAL);
+        if (read_loadavg(&data) == 0) {
+            /* No reader left (sysmond exited) -> SIGPIPE ends this process. */
+            if (write_full(fd, &data, sizeof(data)) != 0) {
+                perror("cpu_sensor: write");
+                close(fd);
+                return EXIT_FAILURE;
+            }
+        }
+        sleep(SAMPLE_INTERVAL);
     }
-
-    return EXIT_SUCCESS;
 }
