@@ -2,7 +2,7 @@
 
 A small Linux system monitor written in C. Three sensor processes collect memory, CPU load and process statistics from `/proc` and send them to a supervisor daemon, `sysmond`, which prints a live status report in the terminal.
 
-This branch, **`phase3`**, is **v3.0**: separate processes that communicate through real Linux IPC, which is an anonymous pipe and two named pipes (FIFOs), carrying binary C structs. See [sysmond-phase-3-guide.md](sysmond-phase-3-guide.md) for the assignment.
+This branch, **`phase3.1`**, is **v3.1**: separate processes that communicate through real Linux IPC, which is an anonymous pipe and two named pipes (FIFOs), carrying binary C structs. **Each sensor sends at its own rate.** See [sysmond-phase-3-guide.md](sysmond-phase-3-guide.md) for the Phase 3 assignment, and [v3.1: different update rates](#v31-different-update-rates) below for the extension.
 
 ## Versions and branches
 
@@ -10,7 +10,8 @@ This branch, **`phase3`**, is **v3.0**: separate processes that communicate thro
 |--------|---------|--------|
 | `phase1` | v1.0 | Sensor processes write text files in `/tmp/sysmon/`, and `sysmond` reads them |
 | `phase2` | v2.0 | One multi-threaded process: shared struct, mutex, condition-variable alert |
-| **`phase3`** | **v3.0** | Sensor processes send binary structs to `sysmond` over a pipe and FIFOs |
+| `phase3` | v3.0 | Sensor processes send binary structs to `sysmond` over a pipe and FIFOs |
+| **`phase3.1`** | **v3.1** | v3.0 where each sensor has a different update interval |
 
 `main` holds v1.0 followed by v2.0. Each version is also tagged (`git checkout v1.0`, `v2.0`, `v3.0`).
 
@@ -31,8 +32,40 @@ This branch, **`phase3`**, is **v3.0**: separate processes that communicate thro
 2. It creates an anonymous pipe with `pipe()`. It forks and `execve`s `mem_sensor`, passing the pipe's write end as a number in `argv[1]` (for example `mem_sensor 4`). Then the parent closes its copy of the write end.
 3. It forks and `execve`s `cpu_sensor` and `proc_sensor`. Each opens its FIFO with `O_WRONLY`.
 4. It opens both FIFOs with `O_RDONLY | O_NONBLOCK`. Non-blocking matters here. A normal open waits for a writer, so it would hang forever if a sensor failed to start.
-5. Every second, each sensor writes one struct (`inc/sysmon_ipc.h`) as raw bytes. Every struct is smaller than `PIPE_BUF`, so each write arrives whole.
-6. `sysmond` waits on all three channels at once with `poll()`, keeps the newest struct from each, and redraws the report every second.
+5. Each sensor writes one struct (`inc/sysmon_ipc.h`) as raw bytes at its own interval. Every struct is smaller than `PIPE_BUF`, so each write arrives whole.
+6. `sysmond` waits on all three channels at once with `poll()`, keeps the newest struct from each, and redraws the report.
+
+## v3.1: different update rates
+
+Each sensor now sends at its own interval, defined in `inc/sysmon_ipc.h` and shared by the sensors and `sysmond`:
+
+| Sensor | Interval | Flagged STALE after |
+|---|---|---|
+| `mem_sensor`  | 1 s (`MEM_INTERVAL`)  | 3 s  |
+| `cpu_sensor`  | 2 s (`CPU_INTERVAL`)  | 6 s  |
+| `proc_sensor` | 4 s (`PROC_INTERVAL`) | 12 s |
+
+**What different rates imply, and how `sysmond` handles each one:**
+
+| Implication | Handling |
+|---|---|
+| Reading one channel must never block the others. A blocking `read()` on `proc_sensor`'s FIFO would freeze the 1 s memory data for up to 4 s. | **`poll()` with non-blocking fds**: one loop waits on all three channels and reads only the ones that have data. This is the "without pthreads" alternative to one reader thread per channel. No threads, no mutex, no shared-memory races. |
+| A single fixed staleness limit is wrong for everyone. 3 s would flag the 4 s sensor between every update, and would be too slow to notice the 1 s sensor stopping. | **Per-sensor staleness**: STALE after 3 × *that sensor's* interval. |
+| A fixed 1 s redraw timer isn't lined up with the sensors, so new data could sit up to a second before being shown. | **Event-driven redraw**: redraw soon after new data arrives (at most every 200 ms), and at least once a second so the "updated Ns ago" ages and STALE flags keep moving during long gaps. |
+| A sensor could send faster than `sysmond` reads. | `drain_channel()` reads everything waiting and keeps only the **newest** struct, so no backlog builds up. |
+| If `sysmond` is killed with `kill -9`, a sensor only notices on its next write (SIGPIPE). | `proc_sensor` may take up to 4 s to exit, instead of about 1 s. A normal shutdown is still immediate, because `sysmond` sends SIGTERM. |
+
+Each section now shows how fresh its data is, including the **measured** interval (a running average of the gaps between arrivals):
+```
+CPU load
+  updated 0.2s ago | every 2s (measured 2.00s) | 9 updates
+```
+
+To see staleness work, freeze a sensor and resume it:
+```bash
+kill -STOP $(pgrep -x mem_sensor)    # after ~3 s: (STALE: no update for 3.2s, expected every 1s)
+kill -CONT $(pgrep -x mem_sensor)    # the flag clears on the next update
+```
 
 **Descriptor hygiene:** each child holds only its own channel. The pipe's read end is marked `FD_CLOEXEC`, and the FIFOs are opened after all the forks. You can check with `ls -l /proc/<pid>/fd`.
 
@@ -52,21 +85,24 @@ Run only the supervisor. It starts the sensors itself:
 ```
 
 ```
-========== sysmon v3.0 report 2026-11-18 15:31:24 ==========
+========== sysmon v3.1 report 2026-11-24 10:37:03 ==========
 Memory
+  updated 0.2s ago | every 1s (measured 1.00s) | 17 updates
   Total:        7481.0 MB
-  Used:         3418.7 MB (45.7%)
-  Free:         1191.6 MB
-  Available:    4062.3 MB
+  Used:         3737.3 MB (50.0%)
+  Free:         1723.4 MB
+  Available:    3743.7 MB
   Swap:            0.0 / 4916.0 MB used (0.0%)
 CPU load
-  1 min: 0.39   5 min: 0.27   15 min: 0.14
+  updated 0.2s ago | every 2s (measured 2.00s) | 9 updates
+  1 min: 0.67   5 min: 0.48   15 min: 0.32
 Processes
-  Running: 365
+  updated 0.2s ago | every 4s (measured 4.00s) | 5 updates
+  Running: 371
 Sensors
-  mem_sensor   pid 15036   running  via anonymous pipe
-  cpu_sensor   pid 15037   running  via /tmp/sysmon_cpu.fifo
-  proc_sensor  pid 15038   running  via /tmp/sysmon_proc.fifo
+  mem_sensor   pid 7180    running  every 1s  via anonymous pipe
+  cpu_sensor   pid 7181    running  every 2s  via /tmp/sysmon_cpu.fifo
+  proc_sensor  pid 7182    running  every 4s  via /tmp/sysmon_proc.fifo
 ```
 
 In a terminal the screen redraws in place with color. Redirected to a file, it's plain text.
