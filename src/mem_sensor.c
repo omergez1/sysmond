@@ -1,5 +1,5 @@
 /*
- * mem_sensor - reads memory metrics from /proc/meminfo every SAMPLE_INTERVAL
+ * mem_sensor - reads memory metrics from /proc/meminfo every MEM_INTERVAL
  * seconds and writes them as a binary MemData struct to a file descriptor.
  *
  * Usage: mem_sensor [fd]
@@ -131,6 +131,6 @@ int main(int argc, char *argv[])
                 return EXIT_FAILURE;
             }
         }
-        sleep(SAMPLE_INTERVAL);
+        sleep(MEM_INTERVAL);
     }
 }

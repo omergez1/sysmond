@@ -1,6 +1,6 @@
 /*
  * cpu_sensor - reads the 1, 5 and 15 minute load averages from /proc/loadavg
- * every SAMPLE_INTERVAL seconds and writes them as a binary CpuData struct
+ * every CPU_INTERVAL seconds and writes them as a binary CpuData struct
  * to the named pipe CPU_FIFO_PATH, which sysmond creates and reads.
  */
 
@@ -79,6 +79,6 @@ int main(void)
                 return EXIT_FAILURE;
             }
         }
-        sleep(SAMPLE_INTERVAL);
+        sleep(CPU_INTERVAL);
     }
 }

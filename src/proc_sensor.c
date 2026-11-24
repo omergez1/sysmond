@@ -1,6 +1,6 @@
 /*
  * proc_sensor - counts running processes (numeric directories in /proc, one
- * per PID) every SAMPLE_INTERVAL seconds and writes the count as a binary
+ * per PID) every PROC_INTERVAL seconds and writes the count as a binary
  * ProcData struct to the named pipe PROC_FIFO_PATH, which sysmond creates
  * and reads.
  */
@@ -91,6 +91,6 @@ int main(void)
                 return EXIT_FAILURE;
             }
         }
-        sleep(SAMPLE_INTERVAL);
+        sleep(PROC_INTERVAL);
     }
 }

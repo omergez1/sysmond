@@ -8,7 +8,16 @@
  *   3. starts cpu_sensor and proc_sensor with fork + execve
  *   4. opens both FIFOs for reading
  * Then it waits on all three channels with poll(), keeps the newest MemData /
- * CpuData / ProcData it receives, and redraws a report every second.
+ * CpuData / ProcData it receives, and redraws the report.
+ *
+ * v3.1: each sensor sends at its own rate (MEM/CPU/PROC_INTERVAL). sysmond
+ * handles that with:
+ *   - poll() instead of threads: one loop watches all channels, so waiting
+ *     for the slow sensor never blocks reading the fast ones
+ *   - per-sensor staleness: data is STALE only after 3 x that sensor's own
+ *     interval, not after one fixed time for everyone
+ *   - event-driven redraw: redraw soon after new data arrives (at most every
+ *     REDRAW_MIN_MS), and at least every REDRAW_MAX_MS so ages stay current
  *
  * If a sensor dies, sysmond keeps running and reports it as SENSOR DOWN.
  * On SIGINT (Ctrl+C) or SIGTERM it stops every sensor, reaps it with
@@ -34,8 +43,9 @@
 
 extern char **environ;      /* the current environment, passed to execve() */
 
-#define REDRAW_MS    1000   /* time between reports */
-#define STALE_AFTER  3      /* seconds without data before flagging it */
+#define REDRAW_MIN_MS  200  /* never redraw more often than this */
+#define REDRAW_MAX_MS 1000  /* redraw at least this often, even with no data */
+#define STALE_FACTOR     3  /* STALE after this many missed intervals */
 
 /* ---------- the sensors ---------- */
 
@@ -50,22 +60,38 @@ struct sensor {
     int    fd;            /* our read end of its channel, or -1 if closed */
     void  *data;          /* where its newest struct is stored */
     size_t size;          /* size of that struct */
+    int    interval;      /* seconds between samples (from sysmon_ipc.h) */
     int    have_data;     /* 1 once a struct has arrived */
-    time_t last_rx;       /* when the newest struct arrived */
+    unsigned rx_count;    /* how many structs have arrived */
+    long   last_rx_ms;    /* when the newest one arrived (now_ms() clock) */
+    long   avg_gap_ms;    /* average time between arrivals (measured rate) */
 };
 
 static MemData  mem_data;
 static CpuData  cpu_data;
 static ProcData proc_data;
 
+/* ".field = value" sets fields by name; every field not named starts as 0. */
 static struct sensor sensors[NUM_SENSORS] = {
-    [MEM]  = { "mem_sensor",  "anonymous pipe",  0, 0, 0, -1,
-               &mem_data,  sizeof(MemData),  0, 0 },
-    [CPU]  = { "cpu_sensor",  CPU_FIFO_PATH,     0, 0, 0, -1,
-               &cpu_data,  sizeof(CpuData),  0, 0 },
-    [PROC] = { "proc_sensor", PROC_FIFO_PATH,    0, 0, 0, -1,
-               &proc_data, sizeof(ProcData), 0, 0 },
+    [MEM]  = { .name = "mem_sensor",  .channel = "anonymous pipe",
+               .fd = -1, .data = &mem_data,  .size = sizeof(MemData),
+               .interval = MEM_INTERVAL },
+    [CPU]  = { .name = "cpu_sensor",  .channel = CPU_FIFO_PATH,
+               .fd = -1, .data = &cpu_data,  .size = sizeof(CpuData),
+               .interval = CPU_INTERVAL },
+    [PROC] = { .name = "proc_sensor", .channel = PROC_FIFO_PATH,
+               .fd = -1, .data = &proc_data, .size = sizeof(ProcData),
+               .interval = PROC_INTERVAL },
 };
+
+/* Milliseconds from a clock that only moves forward (unaffected by changes
+ * to the system time), for measuring ages and intervals. */
+static long now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
+}
 
 /* ---------- signals ---------- */
 
@@ -145,19 +171,22 @@ static pid_t spawn(struct sensor *s, char *arg1, int child_close_fd)
 
 /* Collect any sensors that have exited, without blocking. A child that has
  * exited stays a "zombie" until its parent calls waitpid() on it. */
-static void reap_sensors(void)
+static int reap_sensors(void)
 {
     int status;
     pid_t pid;
+    int reaped = 0;
 
     while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
         for (int i = 0; i < NUM_SENSORS; i++) {
             if (sensors[i].pid == pid) {
                 sensors[i].alive = 0;
                 sensors[i].status = status;
+                reaped++;
             }
         }
     }
+    return reaped;
 }
 
 /* Send SIGTERM to every running sensor, then wait for each one so none is
@@ -218,20 +247,38 @@ static void close_channel(struct sensor *s)
     }
 }
 
+/* Note one struct's arrival: count it and update the measured interval. */
+static void record_arrival(struct sensor *s)
+{
+    long t = now_ms();
+    if (s->rx_count > 0) {
+        long gap = t - s->last_rx_ms;
+        /* Running average that leans on recent gaps:
+         * new = 3/4 old + 1/4 latest. The first gap is taken as is. */
+        s->avg_gap_ms = (s->rx_count == 1) ? gap
+                                           : (3 * s->avg_gap_ms + gap) / 4;
+    }
+    s->rx_count++;
+    s->last_rx_ms = t;
+    s->have_data = 1;
+}
+
 /* Read every complete struct waiting on a sensor's channel and keep the
  * newest one. The fd is non-blocking, so read() returns -1 with EAGAIN once
- * the pipe is empty, instead of waiting. */
-static void drain_channel(struct sensor *s)
+ * the pipe is empty, instead of waiting.
+ * Returns how many structs arrived (0 if none). */
+static int drain_channel(struct sensor *s)
 {
     char buf[64];   /* larger than the largest struct */
+    int got = 0;
 
     while (s->fd >= 0) {
         ssize_t n = read(s->fd, buf, s->size);
 
         if (n == (ssize_t)s->size) {
             memcpy(s->data, buf, s->size);
-            s->have_data = 1;
-            s->last_rx = time(NULL);
+            record_arrival(s);
+            got++;
         } else if (n == 0) {
             /* End of file: the sensor closed its end (it exited). Stop
              * polling this fd, or poll() would report it again forever. */
@@ -245,12 +292,13 @@ static void drain_channel(struct sensor *s)
         } else if (errno == EINTR) {
             continue;
         } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            return;     /* nothing more to read right now */
+            return got;     /* nothing more to read right now */
         } else {
             perror("sysmond: read");
             close_channel(s);
         }
     }
+    return got;
 }
 
 /* ---------- report ---------- */
@@ -274,12 +322,12 @@ static void describe_exit(int status, char *out, size_t size)
         snprintf(out, size, "stopped");
 }
 
-/* Print a section title plus any warning about the sensor.
- * Returns 1 if there is data to print under it. */
+/* Print a section title, any warning about the sensor, and how fresh its
+ * data is. Returns 1 if there is data to print under it. */
 static int print_heading(const char *title, const struct sensor *s)
 {
     printf("%s%s%s\n", bold, title, reset);
-    long age = (long)(time(NULL) - s->last_rx);
+    double age = (double)(now_ms() - s->last_rx_ms) / 1000.0;
 
     if (s->pid == 0) {
         printf("  %s(%s was not started)%s\n", red, s->name, reset);
@@ -287,15 +335,25 @@ static int print_heading(const char *title, const struct sensor *s)
         char how[96];
         describe_exit(s->status, how, sizeof(how));
         if (s->have_data)
-            printf("  %s(SENSOR DOWN: %s %s - last data from %lds ago)%s\n",
+            printf("  %s(SENSOR DOWN: %s %s - last data from %.1fs ago)%s\n",
                    red, s->name, how, age, reset);
         else
             printf("  %s(SENSOR DOWN: %s %s - no data)%s\n",
                    red, s->name, how, reset);
     } else if (!s->have_data) {
         printf("  (waiting for data)\n");
-    } else if (age > STALE_AFTER) {
-        printf("  %s(STALE: last update %lds ago)%s\n", red, age, reset);
+    } else if (age > STALE_FACTOR * s->interval) {
+        /* Judged against this sensor's own interval: 4 s without news is
+         * normal for proc_sensor but means trouble for mem_sensor. */
+        printf("  %s(STALE: no update for %.1fs, expected every %ds)%s\n",
+               red, age, s->interval, reset);
+    }
+
+    if (s->have_data) {
+        printf("  updated %.1fs ago | every %ds", age, s->interval);
+        if (s->rx_count >= 2)
+            printf(" (measured %.2fs)", (double)s->avg_gap_ms / 1000.0);
+        printf(" | %u updates\n", s->rx_count);
     }
     return s->have_data;
 }
@@ -347,8 +405,9 @@ static void print_report(int ansi)
     printf("%sSensors%s\n", bold, reset);
     for (int i = 0; i < NUM_SENSORS; i++) {
         const struct sensor *s = &sensors[i];
-        printf("  %-12s pid %-7d %-8s via %s\n", s->name, (int)s->pid,
-               s->alive ? "running" : "stopped", s->channel);
+        printf("  %-12s pid %-7d %-8s every %ds  via %s\n", s->name,
+               (int)s->pid, s->alive ? "running" : "stopped", s->interval,
+               s->channel);
     }
 
     printf(ansi ? "\n(Ctrl+C to quit)\n" : "\n");
@@ -357,13 +416,6 @@ static void print_report(int ansi)
 }
 
 /* ---------- main ---------- */
-
-static long now_ms(void)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
-}
 
 int main(void)
 {
@@ -435,8 +487,12 @@ int main(void)
         reset = ANSI_RESET;
     }
 
-    /* First report after a short delay, so the first samples have arrived. */
-    long next_redraw = now_ms() + 300;
+    /* Redraw rules (see the comment at the top):
+     *   dirty == 1 means something changed since the last redraw; then
+     *   redraw once REDRAW_MIN_MS has passed. Otherwise redraw anyway after
+     *   REDRAW_MAX_MS, so ages and STALE flags keep moving. */
+    long last_redraw = now_ms();
+    int dirty = 0;
 
     while (!stop_requested) {
         struct pollfd pfd[NUM_SENSORS];
@@ -446,7 +502,10 @@ int main(void)
             pfd[i].revents = 0;
         }
 
-        long wait = next_redraw - now_ms();
+        long due = last_redraw + REDRAW_MAX_MS;
+        if (dirty && last_redraw + REDRAW_MIN_MS < due)
+            due = last_redraw + REDRAW_MIN_MS;
+        long wait = due - now_ms();
         if (wait < 0)
             wait = 0;
 
@@ -462,18 +521,20 @@ int main(void)
         /* POLLIN = data waiting. POLLHUP = the writer is gone. Either way,
          * read: it returns the remaining data and then end-of-file. */
         for (int i = 0; i < NUM_SENSORS; i++) {
-            if (pfd[i].revents & (POLLIN | POLLHUP | POLLERR))
-                drain_channel(&sensors[i]);
+            if ((pfd[i].revents & (POLLIN | POLLHUP | POLLERR)) &&
+                drain_channel(&sensors[i]) > 0)
+                dirty = 1;              /* new data to show */
         }
 
-        reap_sensors();
+        if (reap_sensors() > 0)
+            dirty = 1;                  /* a sensor died: show it soon */
 
         long t = now_ms();
-        if (t >= next_redraw) {
+        if (t - last_redraw >= REDRAW_MAX_MS ||
+            (dirty && t - last_redraw >= REDRAW_MIN_MS)) {
             print_report(ansi);
-            next_redraw += REDRAW_MS;
-            if (next_redraw <= t)          /* fell behind: don't catch up */
-                next_redraw = t + REDRAW_MS;
+            last_redraw = t;
+            dirty = 0;
         }
     }
 

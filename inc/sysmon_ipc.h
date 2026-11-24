@@ -17,8 +17,13 @@
 #define CPU_FIFO_PATH  "/tmp/sysmon_cpu.fifo"
 #define PROC_FIFO_PATH "/tmp/sysmon_proc.fifo"
 
-#define SYSMON_VERSION  "3.0"
-#define SAMPLE_INTERVAL 1       /* seconds between sensor samples */
+#define SYSMON_VERSION  "3.1"
+
+/* Each sensor sends at its own rate (seconds between samples). sysmond
+ * includes this header too, so it knows how often to expect each one. */
+#define MEM_INTERVAL    1
+#define CPU_INTERVAL    2
+#define PROC_INTERVAL   4
 
 typedef struct {
     long mem_total;
