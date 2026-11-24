@@ -1,27 +1,24 @@
 /*
- * cpu_sensor - thread that reads the 1, 5 and 15 minute load averages from
- * /proc/loadavg and stores them in the shared state every SAMPLE_INTERVAL
- * seconds. When load1 rises above ALERT_LOAD_THRESHOLD it wakes the alert
- * thread, once per spike.
+ * cpu_sensor - reads the 1, 5 and 15 minute load averages from /proc/loadavg
+ * every CPU_INTERVAL seconds and writes them as a binary CpuData struct
+ * to the named pipe CPU_FIFO_PATH, which sysmond creates and reads.
  */
 
+#include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
 
-#include <sysmon.h>
+#include <sysmon_ipc.h>
 
 #define LOADAVG_PATH "/proc/loadavg"
-
-struct cpu_stats {
-    double load1;
-    double load5;
-    double load15;
-};
 
 /* Read /proc/loadavg. Its single line looks like:
  *   "0.40 0.28 0.20 3/1092 5850"
  * The first three numbers are the 1, 5 and 15 minute load averages.
  * Returns 0 on success, -1 on failure. */
-static int read_loadavg(struct cpu_stats *stats)
+static int read_loadavg(CpuData *data)
 {
     FILE *fp = fopen(LOADAVG_PATH, "r");
     if (fp == NULL) {
@@ -32,7 +29,7 @@ static int read_loadavg(struct cpu_stats *stats)
     char line[128];
     int ok = fgets(line, sizeof(line), fp) != NULL &&
              sscanf(line, "%lf %lf %lf",
-                    &stats->load1, &stats->load5, &stats->load15) == 3;
+                    &data->load1, &data->load5, &data->load15) == 3;
 
     fclose(fp);
 
@@ -43,37 +40,45 @@ static int read_loadavg(struct cpu_stats *stats)
     return 0;
 }
 
-void *cpu_sensor_thread(void *arg)
+/* Write all len bytes, retrying on partial writes and EINTR.
+ * Returns 0 on success, -1 on error. */
+static int write_full(int fd, const void *buf, size_t len)
 {
-    sysmon_set_thread_name((const char *)arg);
-    struct cpu_stats stats;
-
-    /* 1 while load1 is above the threshold. Used to alert only when the
-     * load crosses the threshold, not on every sample while it stays high.
-     * Only this thread uses it, so it needs no lock. */
-    int above = 0;
-
-    while (sysmon_running()) {
-        if (read_loadavg(&stats) == 0) {
-            pthread_mutex_lock(&g_state.lock);
-            g_state.load1    = stats.load1;
-            g_state.load5    = stats.load5;
-            g_state.load15   = stats.load15;
-            g_state.have_cpu = 1;
-
-            if (stats.load1 > ALERT_LOAD_THRESHOLD) {
-                if (!above) {
-                    above = 1;
-                    g_state.alert_pending   = 1;
-                    g_state.last_alert_load = stats.load1;
-                    pthread_cond_signal(&g_state.alert_cond);
-                }
-            } else {
-                above = 0;   /* back to normal: the next spike alerts again */
-            }
-            pthread_mutex_unlock(&g_state.lock);
+    const char *p = buf;
+    while (len > 0) {
+        ssize_t n = write(fd, p, len);
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
+            return -1;
         }
-        sysmon_sleep(SAMPLE_INTERVAL);
+        p += n;
+        len -= (size_t)n;
     }
-    return NULL;
+    return 0;
+}
+
+int main(void)
+{
+    /* Opening a FIFO for writing waits until someone opens it for reading
+     * (sysmond does, right after starting the sensors). No O_CREAT: if the
+     * FIFO doesn't exist, fail instead of creating a regular file. */
+    int fd = open(CPU_FIFO_PATH, O_WRONLY);
+    if (fd < 0) {
+        perror("cpu_sensor: open " CPU_FIFO_PATH);
+        return EXIT_FAILURE;
+    }
+
+    CpuData data;
+    while (1) {
+        if (read_loadavg(&data) == 0) {
+            /* No reader left (sysmond exited) -> SIGPIPE ends this process. */
+            if (write_full(fd, &data, sizeof(data)) != 0) {
+                perror("cpu_sensor: write");
+                close(fd);
+                return EXIT_FAILURE;
+            }
+        }
+        sleep(CPU_INTERVAL);
+    }
 }

@@ -1,14 +1,19 @@
 /*
- * proc_sensor - thread that counts running processes by scanning /proc for
- * numeric directory names (one per PID) and stores the count in the shared
- * state every SAMPLE_INTERVAL seconds.
+ * proc_sensor - counts running processes (numeric directories in /proc, one
+ * per PID) every PROC_INTERVAL seconds and writes the count as a binary
+ * ProcData struct to the named pipe PROC_FIFO_PATH, which sysmond creates
+ * and reads.
  */
 
 #include <ctype.h>
 #include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
 
-#include <sysmon.h>
+#include <sysmon_ipc.h>
 
 #define PROC_PATH "/proc"
 
@@ -38,7 +43,6 @@ static int count_processes(void)
     int count = 0;
     struct dirent *entry;
 
-    /* readdir() is safe here: each thread uses its own DIR stream. */
     while ((entry = readdir(dir)) != NULL) {
         if (entry->d_type == DT_DIR && is_number(entry->d_name))
             count++;
@@ -48,19 +52,45 @@ static int count_processes(void)
     return count;
 }
 
-void *proc_sensor_thread(void *arg)
+/* Write all len bytes, retrying on partial writes and EINTR.
+ * Returns 0 on success, -1 on error. */
+static int write_full(int fd, const void *buf, size_t len)
 {
-    sysmon_set_thread_name((const char *)arg);
-
-    while (sysmon_running()) {
-        int processes = count_processes();
-        if (processes >= 0) {
-            pthread_mutex_lock(&g_state.lock);
-            g_state.total_procs = processes;
-            g_state.have_procs  = 1;
-            pthread_mutex_unlock(&g_state.lock);
+    const char *p = buf;
+    while (len > 0) {
+        ssize_t n = write(fd, p, len);
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
+            return -1;
         }
-        sysmon_sleep(SAMPLE_INTERVAL);
+        p += n;
+        len -= (size_t)n;
     }
-    return NULL;
+    return 0;
+}
+
+int main(void)
+{
+    /* Waits until sysmond opens the FIFO for reading. No O_CREAT: if the
+     * FIFO doesn't exist, fail instead of creating a regular file. */
+    int fd = open(PROC_FIFO_PATH, O_WRONLY);
+    if (fd < 0) {
+        perror("proc_sensor: open " PROC_FIFO_PATH);
+        return EXIT_FAILURE;
+    }
+
+    ProcData data;
+    while (1) {
+        data.total_procs = count_processes();
+        if (data.total_procs >= 0) {
+            /* No reader left (sysmond exited) -> SIGPIPE ends this process. */
+            if (write_full(fd, &data, sizeof(data)) != 0) {
+                perror("proc_sensor: write");
+                close(fd);
+                return EXIT_FAILURE;
+            }
+        }
+        sleep(PROC_INTERVAL);
+    }
 }

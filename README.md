@@ -1,122 +1,140 @@
 # sysmon
 
-A small Linux system monitor written in C. `sysmond` samples memory, CPU load and process statistics from `/proc` and prints a live status report in the terminal. If the CPU load spikes, it prints an alert.
+A small Linux system monitor written in C. Three sensor processes collect memory, CPU load and process statistics from `/proc` and send them to a supervisor daemon, `sysmond`, which prints a live status report in the terminal.
 
-This is a course project built in phases:
+This branch, **`phase3.1`**, is **v3.1**: separate processes that communicate through real Linux IPC, which is an anonymous pipe and two named pipes (FIFOs), carrying binary C structs. **Each sensor sends at its own rate.** See [sysmond-phase-3-guide.md](sysmond-phase-3-guide.md) for the Phase 3 assignment, and [v3.1: different update rates](#v31-different-update-rates) below for the extension.
 
-| Version | Phase | Design |
-|---------|-------|--------|
-| **v2.0** (current) | 2 | One multi-threaded program. Threads share an in-memory struct protected by a mutex, and a condition variable wakes the alert thread. See [sysmond-phase-2-guide.md](sysmond-phase-2-guide.md). |
-| v1.0 | 1 | Separate sensor processes write `/tmp/sysmon/*.dat` files, and `sysmond` starts them with `fork` + `exec` and reads the files. See [sysmond-phase-1-guide.md](sysmond-phase-1-guide.md). |
+## Versions and branches
 
-To look at or build v1.0: `git checkout v1.0` (return with `git switch main`).
+| Branch | Version | Design |
+|--------|---------|--------|
+| `phase1` | v1.0 | Sensor processes write text files in `/tmp/sysmon/`, and `sysmond` reads them |
+| `phase2` | v2.0 | One multi-threaded process: shared struct, mutex, condition-variable alert |
+| `phase3` | v3.0 | Sensor processes send binary structs to `sysmond` over a pipe and FIFOs |
+| **`phase3.1`** | **v3.1** | v3.0 where each sensor has a different update interval |
+
+`main` holds v1.0 followed by v2.0. Each version is also tagged (`git checkout v1.0`, `v2.0`, `v3.0`).
 
 ## How it works
 
 ```
-                       sysmond (one process)
-  ┌──────────────────────────────────────────────────────────────┐
-  │  mem_sensor  ──┐  lock, update, unlock                       │
-  │  cpu_sensor  ──┼──────────────────────>  SystemState g_state │
-  │  proc_sensor ──┘                         (mutex: lock)       │
-  │       │                                        │             │
-  │       │ load1 > 1.50: pthread_cond_signal      │ lock, copy, │
-  │       v                                        │ unlock      │
-  │  alert ── waits on alert_cond,                 v             │
-  │           prints alert to stderr          main thread:       │
-  │                                           redraws the report │
-  │                                           every 2 s          │
-  └──────────────────────────────────────────────────────────────┘
+                  sysmond  (supervisor: fork + execve, poll, cleanup)
+                     ^                  ^                    ^
+   anonymous pipe    |   named pipe     |   named pipe       |
+   (fd in argv[1])   |   /tmp/sysmon_cpu.fifo                /tmp/sysmon_proc.fifo
+                     |                  |                    |
+               mem_sensor          cpu_sensor           proc_sensor
+            /proc/meminfo        /proc/loadavg        /proc/<pid>/ count
+              -> MemData           -> CpuData           -> ProcData
 ```
 
-| Thread        | Job |
-|---------------|-----|
-| `mem_sensor`  | Reads `/proc/meminfo` (MemTotal, MemFree, MemAvailable, SwapTotal, SwapFree) |
-| `cpu_sensor`  | Reads `/proc/loadavg` (1, 5 and 15 minute load). Signals `alert` when the 1-minute load goes above 1.50 |
-| `proc_sensor` | Counts the numeric folders in `/proc` (one per running process) |
-| `alert`       | Sleeps in `pthread_cond_wait` until signaled, then prints an alert to stderr |
-| main          | Starts the threads, redraws the report every 2 s, and shuts everything down on Ctrl+C |
+1. `sysmond` creates the two FIFOs with `mkfifo()`. A FIFO left behind by a run that was killed is replaced. If anything else is at that path, `sysmond` stops with an error.
+2. It creates an anonymous pipe with `pipe()`. It forks and `execve`s `mem_sensor`, passing the pipe's write end as a number in `argv[1]` (for example `mem_sensor 4`). Then the parent closes its copy of the write end.
+3. It forks and `execve`s `cpu_sensor` and `proc_sensor`. Each opens its FIFO with `O_WRONLY`.
+4. It opens both FIFOs with `O_RDONLY | O_NONBLOCK`. Non-blocking matters here. A normal open waits for a writer, so it would hang forever if a sensor failed to start.
+5. Each sensor writes one struct (`inc/sysmon_ipc.h`) as raw bytes at its own interval. Every struct is smaller than `PIPE_BUF`, so each write arrives whole.
+6. `sysmond` waits on all three channels at once with `poll()`, keeps the newest struct from each, and redraws the report.
 
-**Thread-safety rules used throughout:**
-- Every read or write of `g_state` happens between `pthread_mutex_lock` and `pthread_mutex_unlock`.
-- Slow work, like reading `/proc` or printing, happens *outside* the lock. Sensors read into local variables and then lock only to copy the values in. The main thread copies a snapshot under the lock and prints after unlocking.
-- `pthread_cond_wait` is always called in a loop that checks a flag (`alert_pending`). This protects against wakeups with no signal ("spurious wakeups") and against signals sent before the thread started waiting.
-- SIGINT and SIGTERM are blocked in every thread and collected only by the main thread with `sigtimedwait`, so a signal never interrupts a worker at a random point.
+## v3.1: different update rates
 
-**Alerts happen once per spike:** an alert fires when the 1-minute load *crosses* above 1.50. It fires again only after the load drops back to 1.50 or below and then rises again. While the load is high, the report also shows a red `HIGH LOAD` line.
+Each sensor now sends at its own interval, defined in `inc/sysmon_ipc.h` and shared by the sensors and `sysmond`:
+
+| Sensor | Interval | Flagged STALE after |
+|---|---|---|
+| `mem_sensor`  | 1 s (`MEM_INTERVAL`)  | 3 s  |
+| `cpu_sensor`  | 2 s (`CPU_INTERVAL`)  | 6 s  |
+| `proc_sensor` | 4 s (`PROC_INTERVAL`) | 12 s |
+
+**What different rates imply, and how `sysmond` handles each one:**
+
+| Implication | Handling |
+|---|---|
+| Reading one channel must never block the others. A blocking `read()` on `proc_sensor`'s FIFO would freeze the 1 s memory data for up to 4 s. | **`poll()` with non-blocking fds**: one loop waits on all three channels and reads only the ones that have data. This is the "without pthreads" alternative to one reader thread per channel. No threads, no mutex, no shared-memory races. |
+| A single fixed staleness limit is wrong for everyone. 3 s would flag the 4 s sensor between every update, and would be too slow to notice the 1 s sensor stopping. | **Per-sensor staleness**: STALE after 3 × *that sensor's* interval. |
+| A fixed 1 s redraw timer isn't lined up with the sensors, so new data could sit up to a second before being shown. | **Event-driven redraw**: redraw soon after new data arrives (at most every 200 ms), and at least once a second so the "updated Ns ago" ages and STALE flags keep moving during long gaps. |
+| A sensor could send faster than `sysmond` reads. | `drain_channel()` reads everything waiting and keeps only the **newest** struct, so no backlog builds up. |
+| If `sysmond` is killed with `kill -9`, a sensor only notices on its next write (SIGPIPE). | `proc_sensor` may take up to 4 s to exit, instead of about 1 s. A normal shutdown is still immediate, because `sysmond` sends SIGTERM. |
+
+Each section now shows how fresh its data is, including the **measured** interval (a running average of the gaps between arrivals):
+```
+CPU load
+  updated 0.2s ago | every 2s (measured 2.00s) | 9 updates
+```
+
+To see staleness work, freeze a sensor and resume it:
+```bash
+kill -STOP $(pgrep -x mem_sensor)    # after ~3 s: (STALE: no update for 3.2s, expected every 1s)
+kill -CONT $(pgrep -x mem_sensor)    # the flag clears on the next update
+```
+
+**Descriptor hygiene:** each child holds only its own channel. The pipe's read end is marked `FD_CLOEXEC`, and the FIFOs are opened after all the forks. You can check with `ls -l /proc/<pid>/fd`.
 
 ## Building
 
-Requires `gcc` and `make` on Linux.
-
 ```bash
-make          # builds bin/sysmond (object files go in obj/)
-make clean    # removes bin/ contents and obj/
-```
-
-The alert threshold can be changed when building, for example to test the alert without creating CPU load:
-```bash
-gcc -Wall -g -Iinc -pthread -DALERT_LOAD_THRESHOLD=0.0 src/*.c -o bin/sysmond_test
+make          # builds bin/sysmond, bin/mem_sensor, bin/cpu_sensor, bin/proc_sensor
+make clean
 ```
 
 ## Running
+
+Run only the supervisor. It starts the sensors itself:
 
 ```bash
 ./bin/sysmond          # Ctrl+C to stop
 ```
 
-In a terminal, the screen is redrawn in place with colors. When the output goes to a file or a pipe, it's plain text with no color codes.
-
 ```
-========== sysmon v2.0 report 2026-11-17 20:18:11 ==========
+========== sysmon v3.1 report 2026-11-24 10:37:03 ==========
 Memory
+  updated 0.2s ago | every 1s (measured 1.00s) | 17 updates
   Total:        7481.0 MB
-  Used:         3607.1 MB (48.2%)
-  Free:         1179.2 MB
-  Available:    3873.9 MB
-  Swap:          262.5 / 4916.0 MB used (5.3%)
+  Used:         3737.3 MB (50.0%)
+  Free:         1723.4 MB
+  Available:    3743.7 MB
+  Swap:            0.0 / 4916.0 MB used (0.0%)
 CPU load
-  1 min: 1.84   5 min: 0.87   15 min: 0.54
-  HIGH LOAD: 1-min load is above 1.50
+  updated 0.2s ago | every 2s (measured 2.00s) | 9 updates
+  1 min: 0.67   5 min: 0.48   15 min: 0.32
 Processes
-  Running: 364
-Alerts
-  Last alert: 20:18:52 (load 1.84)
+  updated 0.2s ago | every 4s (measured 4.00s) | 5 updates
+  Running: 371
+Sensors
+  mem_sensor   pid 7180    running  every 1s  via anonymous pipe
+  cpu_sensor   pid 7181    running  every 2s  via /tmp/sysmon_cpu.fifo
+  proc_sensor  pid 7182    running  every 4s  via /tmp/sysmon_proc.fifo
 ```
 
-The alert itself goes to stderr:
-```
-*** ALERT 20:18:52: high CPU load 1.84 (threshold 1.50) ***
-```
+In a terminal the screen redraws in place with color. Redirected to a file, it's plain text.
 
-To trigger it with real load, run a few busy loops for a minute, then stop them:
-```bash
-for i in 1 2 3 4; do yes > /dev/null & done     # wait ~30-60 s for the 1-min load to rise
-kill %1 %2 %3 %4
-```
+## Shutdown and failures
+
+| Situation | What happens |
+|-----------|--------------|
+| Ctrl+C or `kill` on `sysmond` | The handler sets a flag, which ends the main loop. Then: SIGTERM to each sensor, `waitpid()` for each, close all descriptors, `unlink()` both FIFOs. Exit code 0. |
+| A sensor dies | `sysmond` keeps running and shows `SENSOR DOWN: <name> killed by signal N`. The child is reaped (no zombie), and its channel is closed so `poll()` doesn't spin. |
+| `sysmond` is killed with `kill -9` | Each sensor's next write gets SIGPIPE (no reader left), so the sensors exit by themselves within about 1 s. The FIFO files stay behind and are replaced on the next start. |
+| A sensor program is missing | The child exits with code 127, and the report shows `SENSOR DOWN: ... exited with code 127`. Nothing hangs. |
 
 ## Checking that it works
 
+In a second terminal while `sysmond` runs:
+
 ```bash
-ps -T -p $(pgrep -x sysmond)    # 5 threads: sysmond, mem_sensor, cpu_sensor, proc_sensor, alert
-free -m                         # compare with the Memory section
-cat /proc/loadavg               # compare with CPU load
-ls /proc | grep -c '^[0-9]*$'   # compare with Processes
-valgrind --tool=helgrind ./bin/sysmond   # checks for data races (Ctrl+C to stop)
+ps -f -C sysmond,mem_sensor,cpu_sensor,proc_sensor   # sysmond + 3 sensors; sensors' PPID = sysmond's PID
+ls -l /tmp/sysmon_*.fifo                   # type 'p' = named pipe
+ls -l /proc/$(pgrep -x cpu_sensor)/fd      # only 0, 1, 2 and its own FIFO
 ```
 
-## v1 vs v2
+`ps -C` selects processes by program name, so it finds `sysmond` however it was started. The guide's `ps -ef | grep bin/` also works, but it matches every program in `/usr/bin` too. Add `| grep -v -e grep -e /usr/` to hide those.
 
-Both versions measured on the same machine at the same time:
+After Ctrl+C, the same commands should show no sensors and no FIFO files.
 
-| | v1.0 (processes + files) | v2.0 (threads + shared memory) |
-|---|---|---|
-| Processes | 4 | 1 (5 threads) |
-| Memory (RSS) | 6.7 MB total | 1.8 MB |
-| System calls in 20 s | 718 | 347 |
-| CPU time per minute | ~0.01 s | ~0.01 s |
-| Files written | 3 `.dat` files every 2 s | none |
-| A sensor can crash alone | yes | no (a crash takes the whole program down) |
+Run a sensor by hand to see its raw binary output, decoded:
+```bash
+./bin/mem_sensor | head -c 120 | od -An -t d8 -w40
+```
+This takes 3 records (3 × 40 bytes, one per second) and prints each as 5 numbers in kB: MemTotal, MemFree, MemAvailable, SwapTotal, SwapFree. Once `head` has its 120 bytes it exits, and `mem_sensor`'s next write gets SIGPIPE, so it stops by itself. That's the same mechanism that stops the sensors if `sysmond` is killed.
 
 ## Project layout
 
@@ -125,15 +143,13 @@ Both versions measured on the same machine at the same time:
 ├── Makefile
 ├── README.md
 ├── sysmond-phase-1-guide.md
-├── sysmond-phase-2-guide.md
+├── sysmond-phase-3-guide.md
 ├── inc/
-│   └── sysmon.h        # SystemState, shared declarations, version, threshold
+│   └── sysmon_ipc.h     # MemData, CpuData, ProcData, FIFO paths, version
 ├── src/
-│   ├── sysmond.c       # main thread: setup, report, shutdown
-│   ├── mem_sensor.c    # mem_sensor_thread
-│   ├── cpu_sensor.c    # cpu_sensor_thread + alert trigger
-│   ├── proc_sensor.c   # proc_sensor_thread
-│   └── alert.c         # alert_thread
-├── obj/                # compiled .o files (not tracked by git)
-└── bin/                # sysmond (not tracked by git)
+│   ├── sysmond.c        # supervisor: FIFOs, pipe, fork/execve, poll loop, cleanup
+│   ├── mem_sensor.c     # writes MemData to the fd given in argv[1]
+│   ├── cpu_sensor.c     # writes CpuData to /tmp/sysmon_cpu.fifo
+│   └── proc_sensor.c    # writes ProcData to /tmp/sysmon_proc.fifo
+└── bin/                 # built programs (not tracked by git)
 ```
