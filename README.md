@@ -153,3 +153,7 @@ This takes 3 records (3 × 40 bytes, one per second) and prints each as 5 number
 │   └── proc_sensor.c    # writes ProcData to /tmp/sysmon_proc.fifo
 └── bin/                 # built programs (not tracked by git)
 ```
+
+## Lab report
+
+The Phase 3 lab (fd inheritance, FIFO blocking, EOF vs SIGPIPE, zombies) is in [diagnostics.md](diagnostics.md). Its screenshots are in `screenshots/`.

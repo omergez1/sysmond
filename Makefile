@@ -1,5 +1,5 @@
 CC     = gcc
-CFLAGS = -Wall -g -Iinc
+CFLAGS = -Wall -Wextra -Werror -g -Iinc
 
 BINS = bin/sysmond bin/mem_sensor bin/cpu_sensor bin/proc_sensor
 
