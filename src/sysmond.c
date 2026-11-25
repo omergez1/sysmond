@@ -1,18 +1,27 @@
 /*
- * sysmond (v3) - supervisor and IPC receiver.
+ * sysmond (v3b) - fault-tolerant supervisor (watchdog) and IPC receiver.
  *
  * On startup it:
  *   1. creates the named pipes CPU_FIFO_PATH and PROC_FIFO_PATH (mkfifo)
+ *      and opens them for reading
  *   2. creates an anonymous pipe and starts mem_sensor with fork + execve,
  *      passing the pipe's write end as argv[1]
  *   3. starts cpu_sensor and proc_sensor with fork + execve
- *   4. opens both FIFOs for reading
  * Then it waits on all three channels with poll(), keeps the newest MemData /
  * CpuData / ProcData it receives, and redraws a report every second.
  *
- * If a sensor dies, sysmond keeps running and reports it as SENSOR DOWN.
- * On SIGINT (Ctrl+C) or SIGTERM it stops every sensor, reaps it with
- * waitpid(), closes all descriptors and removes the FIFO files.
+ * Watchdog: when a sensor dies, read() on its channel returns 0 (end of
+ * file). sysmond then reaps the child with waitpid(), rebuilds the channel
+ * and starts the sensor again:
+ *   - mem_sensor: the old anonymous pipe can never get a writer again, so it
+ *     is closed and a new pipe is created for the new mem_sensor.
+ *   - cpu_sensor / proc_sensor: the FIFO read end stays open. The new sensor
+ *     opens the same FIFO for writing and the data continues on the same fd.
+ * The other sensors are not affected. Each sensor's restarts are counted and
+ * shown in the report.
+ *
+ * On SIGINT (Ctrl+C) or SIGTERM it stops every sensor (no restarts), reaps
+ * them with waitpid(), closes all descriptors and removes the FIFO files.
  */
 
 #include <errno.h>
@@ -21,6 +30,7 @@
 #include <limits.h>
 #include <poll.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -34,8 +44,14 @@
 
 extern char **environ;      /* the current environment, passed to execve() */
 
-#define REDRAW_MS    1000   /* time between reports */
-#define STALE_AFTER  3      /* seconds without data before flagging it */
+#define REDRAW_MS        1000  /* time between reports */
+#define STALE_AFTER      3     /* seconds without data before flagging it */
+#define RESTART_MIN_MS   1000  /* at least this long between two starts of
+                                  the same sensor, so a sensor that dies
+                                  right away can't restart in a tight loop */
+#define ATTACH_CHECK_MS  50    /* how often to check whether a new FIFO
+                                  writer has connected */
+#define LOG_LINES        5     /* recovery events kept for the report */
 
 /* ---------- the sensors ---------- */
 
@@ -44,10 +60,15 @@ enum { MEM, CPU, PROC, NUM_SENSORS };
 struct sensor {
     const char *name;     /* program name, in the same folder as sysmond */
     const char *channel;  /* how its data arrives, for the report */
-    pid_t  pid;           /* child PID, or 0 if it was never started */
-    int    alive;         /* 1 until waitpid() reports that it ended */
-    int    status;        /* waitpid() status, valid once alive == 0 */
+    int    uses_pipe;     /* 1: anonymous pipe (mem_sensor), 0: FIFO */
+    pid_t  pid;           /* current child PID, or 0 if never started */
+    int    alive;         /* 1 from fork() until waitpid() reports its end */
+    int    status;        /* waitpid() status of the last child that ended */
     int    fd;            /* our read end of its channel, or -1 if closed */
+    int    attached;      /* 1 while a writer is connected to fd */
+    int    restarts;      /* how many times the watchdog restarted it */
+    long   started_ms;    /* when the current child was started */
+    long   restart_at;    /* if > 0: restart it at this time (now_ms) */
     void  *data;          /* where its newest struct is stored */
     size_t size;          /* size of that struct */
     int    have_data;     /* 1 once a struct has arrived */
@@ -59,12 +80,13 @@ static CpuData  cpu_data;
 static ProcData proc_data;
 
 static struct sensor sensors[NUM_SENSORS] = {
-    [MEM]  = { "mem_sensor",  "anonymous pipe",  0, 0, 0, -1,
-               &mem_data,  sizeof(MemData),  0, 0 },
-    [CPU]  = { "cpu_sensor",  CPU_FIFO_PATH,     0, 0, 0, -1,
-               &cpu_data,  sizeof(CpuData),  0, 0 },
-    [PROC] = { "proc_sensor", PROC_FIFO_PATH,    0, 0, 0, -1,
-               &proc_data, sizeof(ProcData), 0, 0 },
+    [MEM]  = { .name = "mem_sensor",  .channel = "anonymous pipe",
+               .uses_pipe = 1, .fd = -1,
+               .data = &mem_data,  .size = sizeof(MemData) },
+    [CPU]  = { .name = "cpu_sensor",  .channel = CPU_FIFO_PATH,
+               .fd = -1, .data = &cpu_data,  .size = sizeof(CpuData) },
+    [PROC] = { .name = "proc_sensor", .channel = PROC_FIFO_PATH,
+               .fd = -1, .data = &proc_data, .size = sizeof(ProcData) },
 };
 
 /* ---------- signals ---------- */
@@ -77,6 +99,51 @@ static void on_stop_signal(int sig)
 {
     (void)sig;
     stop_requested = 1;
+}
+
+/* ---------- helpers ---------- */
+
+static long now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
+}
+
+/* Describe how a child ended, e.g. "killed by signal 9 (Killed)". */
+static void describe_exit(int status, char *out, size_t size)
+{
+    if (WIFEXITED(status))
+        snprintf(out, size, "exited with code %d", WEXITSTATUS(status));
+    else if (WIFSIGNALED(status))
+        snprintf(out, size, "killed by signal %d (%s)",
+                 WTERMSIG(status), strsignal(WTERMSIG(status)));
+    else
+        snprintf(out, size, "stopped");
+}
+
+/* Recovery log: the last LOG_LINES events, each starting with the time. */
+static char event_log[LOG_LINES][160];
+static int  log_next = 0, log_count = 0;
+
+static void log_event(const char *fmt, ...)
+{
+    char stamp[16];
+    struct tm tm;
+    time_t now = time(NULL);
+    strftime(stamp, sizeof(stamp), "%H:%M:%S", localtime_r(&now, &tm));
+
+    char text[128];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(text, sizeof(text), fmt, ap);
+    va_end(ap);
+
+    snprintf(event_log[log_next], sizeof(event_log[log_next]), "%s %s",
+             stamp, text);
+    log_next = (log_next + 1) % LOG_LINES;
+    if (log_count < LOG_LINES)
+        log_count++;
 }
 
 /* ---------- starting and stopping sensors ---------- */
@@ -105,9 +172,10 @@ static int sensor_path(const char *name, char *out, size_t size)
 
 /* fork() a child and execve() the sensor program in it.
  * arg1: optional first argument for the sensor (NULL: none).
- * child_close_fd: a descriptor the child must close before exec (-1: none).
+ * Every descriptor sysmond reads from is marked FD_CLOEXEC, so execve()
+ * closes them in the child: a sensor only keeps the channel it writes to.
  * Returns the child's PID, or -1 on failure. */
-static pid_t spawn(struct sensor *s, char *arg1, int child_close_fd)
+static pid_t spawn(struct sensor *s, char *arg1)
 {
     char path[PATH_MAX];
     if (sensor_path(s->name, path, sizeof(path)) != 0)
@@ -128,9 +196,6 @@ static pid_t spawn(struct sensor *s, char *arg1, int child_close_fd)
     }
 
     if (pid == 0) {
-        /* Child: close what it must not hold, then become the sensor. */
-        if (child_close_fd >= 0)
-            close(child_close_fd);
         execve(path, argv, environ);
         /* execve only returns if it failed. */
         perror(path);
@@ -143,28 +208,151 @@ static pid_t spawn(struct sensor *s, char *arg1, int child_close_fd)
     return pid;
 }
 
-/* Collect any sensors that have exited, without blocking. A child that has
- * exited stays a "zombie" until its parent calls waitpid() on it. */
-static void reap_sensors(void)
+static void close_channel(struct sensor *s)
+{
+    if (s->fd >= 0) {
+        close(s->fd);
+        s->fd = -1;
+    }
+    s->attached = 0;
+}
+
+/* Start (or restart) a sensor together with its channel.
+ * Returns 0 on success, -1 on failure. */
+static int start_sensor(struct sensor *s)
+{
+    s->started_ms = now_ms();
+
+    if (!s->uses_pipe) {
+        /* FIFO: our read end is already open. The sensor opens the FIFO for
+         * writing itself; until it does, there is no writer (attached = 0). */
+        s->attached = 0;
+        return spawn(s, NULL) > 0 ? 0 : -1;
+    }
+
+    /* Anonymous pipe. An old pipe whose writer died can never get a new
+     * writer (it has no name to open), so it is closed and a new one made. */
+    close_channel(s);
+
+    int pipefd[2];          /* pipefd[0] = read end, pipefd[1] = write end */
+    if (pipe(pipefd) != 0) {
+        perror("pipe");
+        return -1;
+    }
+    /* FD_CLOEXEC: the read end closes automatically in any program we
+     * execve(), so no sensor ever holds it by accident. */
+    fcntl(pipefd[0], F_SETFD, FD_CLOEXEC);
+    fcntl(pipefd[0], F_SETFL, O_NONBLOCK);
+
+    char fd_arg[16];
+    snprintf(fd_arg, sizeof(fd_arg), "%d", pipefd[1]);
+    pid_t pid = spawn(s, fd_arg);
+
+    /* The parent never writes to the pipe. Closing our write end means that
+     * when mem_sensor exits, no writer is left and we get end-of-file. It
+     * also means no later child can inherit it. */
+    close(pipefd[1]);
+
+    if (pid < 0) {
+        close(pipefd[0]);
+        return -1;
+    }
+    s->fd = pipefd[0];
+    s->attached = 1;
+    return 0;
+}
+
+static int drain_channel(struct sensor *s);
+
+/* A sensor's child has ended and was reaped: keep its status, retire its
+ * channel and schedule the restart (unless sysmond itself is stopping). */
+static void sensor_ended(struct sensor *s, int status)
+{
+    s->alive = 0;
+    s->status = status;
+
+    /* Keep any data it wrote just before it died. */
+    if (s->fd >= 0 && s->attached)
+        drain_channel(s);
+
+    if (s->uses_pipe)
+        close_channel(s);   /* dead for good; restart makes a new pipe */
+    else
+        s->attached = 0;    /* keep the FIFO open for the next writer */
+
+    if (!stop_requested) {
+        long now = now_ms();
+        long earliest = s->started_ms + RESTART_MIN_MS;
+        s->restart_at = now > earliest ? now : earliest;
+    }
+}
+
+/* End-of-file on a sensor's channel: its writer is gone, which means the
+ * sensor died. Reap that child now so it doesn't stay a zombie. */
+static void reap_sensor(struct sensor *s)
+{
+    int status = 0;
+    pid_t r;
+
+    while ((r = waitpid(s->pid, &status, WNOHANG)) < 0 && errno == EINTR)
+        ;
+    if (r == 0) {
+        /* Not finished exiting yet, or it closed its channel and is still
+         * running. Either way it can't send data any more: end it. */
+        kill(s->pid, SIGKILL);
+        while ((r = waitpid(s->pid, &status, 0)) < 0 && errno == EINTR)
+            ;
+    }
+    sensor_ended(s, status);
+}
+
+/* Collect any sensor that has exited, without blocking. This catches a
+ * sensor that died without us seeing end-of-file, e.g. one that failed
+ * before it ever opened its FIFO. */
+static void reap_any(void)
 {
     int status;
     pid_t pid;
 
     while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
         for (int i = 0; i < NUM_SENSORS; i++) {
-            if (sensors[i].pid == pid) {
-                sensors[i].alive = 0;
-                sensors[i].status = status;
-            }
+            if (sensors[i].alive && sensors[i].pid == pid)
+                sensor_ended(&sensors[i], status);
+        }
+    }
+}
+
+/* Restart every sensor whose restart time has come. */
+static void restart_due_sensors(void)
+{
+    long now = now_ms();
+
+    for (int i = 0; i < NUM_SENSORS; i++) {
+        struct sensor *s = &sensors[i];
+        if (s->alive || s->restart_at == 0 || now < s->restart_at)
+            continue;
+
+        s->restart_at = 0;
+        char how[96];
+        describe_exit(s->status, how, sizeof(how));
+
+        if (start_sensor(s) == 0) {
+            s->restarts++;
+            log_event("%s %s -> restarted as pid %d (restart %d)",
+                      s->name, how, (int)s->pid, s->restarts);
+        } else {
+            log_event("%s %s -> restart failed, retrying", s->name, how);
+            s->restart_at = now + RESTART_MIN_MS;
         }
     }
 }
 
 /* Send SIGTERM to every running sensor, then wait for each one so none is
- * left behind as an orphan or a zombie. */
+ * left behind as an orphan or a zombie. Nothing is restarted. */
 static void stop_sensors(void)
 {
     for (int i = 0; i < NUM_SENSORS; i++) {
+        sensors[i].restart_at = 0;
         if (sensors[i].alive)
             kill(sensors[i].pid, SIGTERM);
     }
@@ -210,47 +398,63 @@ static int make_fifo(const char *path)
     return 0;
 }
 
-static void close_channel(struct sensor *s)
-{
-    if (s->fd >= 0) {
-        close(s->fd);
-        s->fd = -1;
-    }
-}
-
 /* Read every complete struct waiting on a sensor's channel and keep the
  * newest one. The fd is non-blocking, so read() returns -1 with EAGAIN once
- * the pipe is empty, instead of waiting. */
-static void drain_channel(struct sensor *s)
+ * the pipe is empty, instead of waiting.
+ * read() returning 0 (end of file) means no writer is connected.
+ * Returns 1 on end of file (or a broken channel), 0 otherwise. */
+static int drain_channel(struct sensor *s)
 {
     char buf[64];   /* larger than the largest struct */
 
-    while (s->fd >= 0) {
+    for (;;) {
         ssize_t n = read(s->fd, buf, s->size);
 
         if (n == (ssize_t)s->size) {
             memcpy(s->data, buf, s->size);
             s->have_data = 1;
             s->last_rx = time(NULL);
+            s->attached = 1;
         } else if (n == 0) {
-            /* End of file: the sensor closed its end (it exited). Stop
-             * polling this fd, or poll() would report it again forever. */
-            close_channel(s);
+            return 1;
         } else if (n > 0) {
             /* Can't happen: every write is one whole struct of at most
              * PIPE_BUF bytes, which the kernel delivers in one piece. */
-            fprintf(stderr, "sysmond: %s sent %zd of %zu bytes, closing\n",
+            fprintf(stderr, "sysmond: %s sent %zd of %zu bytes\n",
                     s->name, n, s->size);
-            close_channel(s);
+            return 1;
         } else if (errno == EINTR) {
             continue;
         } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            return;     /* nothing more to read right now */
+            /* Empty, but a writer is connected (with no writer, read()
+             * would have returned 0). */
+            s->attached = 1;
+            return 0;
         } else {
             perror("sysmond: read");
-            close_channel(s);
+            return 1;
         }
     }
+}
+
+/* Read a channel and react to end of file. */
+static void check_channel(struct sensor *s)
+{
+    int was_attached = s->attached;
+
+    if (drain_channel(s) == 0)
+        return;
+
+    /* End of file. On a FIFO whose new writer hasn't connected yet this is
+     * normal: keep waiting. Otherwise the writer is gone: the sensor died. */
+    if (!was_attached && !s->attached)
+        return;
+    if (s->alive)
+        reap_sensor(s);
+    else if (s->uses_pipe)
+        close_channel(s);
+    else
+        s->attached = 0;
 }
 
 /* ---------- report ---------- */
@@ -262,18 +466,6 @@ static void drain_channel(struct sensor *s)
 
 static const char *bold = "", *red = "", *reset = "";
 
-/* Describe how a child ended, e.g. "exited with code 127". */
-static void describe_exit(int status, char *out, size_t size)
-{
-    if (WIFEXITED(status))
-        snprintf(out, size, "exited with code %d", WEXITSTATUS(status));
-    else if (WIFSIGNALED(status))
-        snprintf(out, size, "killed by signal %d (%s)",
-                 WTERMSIG(status), strsignal(WTERMSIG(status)));
-    else
-        snprintf(out, size, "stopped");
-}
-
 /* Print a section title plus any warning about the sensor.
  * Returns 1 if there is data to print under it. */
 static int print_heading(const char *title, const struct sensor *s)
@@ -281,17 +473,19 @@ static int print_heading(const char *title, const struct sensor *s)
     printf("%s%s%s\n", bold, title, reset);
     long age = (long)(time(NULL) - s->last_rx);
 
-    if (s->pid == 0) {
+    if (s->pid == 0 && s->restart_at == 0) {
         printf("  %s(%s was not started)%s\n", red, s->name, reset);
     } else if (!s->alive) {
         char how[96];
         describe_exit(s->status, how, sizeof(how));
-        if (s->have_data)
-            printf("  %s(SENSOR DOWN: %s %s - last data from %lds ago)%s\n",
-                   red, s->name, how, age, reset);
-        else
-            printf("  %s(SENSOR DOWN: %s %s - no data)%s\n",
-                   red, s->name, how, reset);
+        if (s->restart_at > 0) {
+            long in = s->restart_at - now_ms();
+            printf("  %s(RESTARTING: %s %s - restart in %.1fs)%s\n",
+                   red, s->name, how, in > 0 ? (double)in / 1000.0 : 0.0,
+                   reset);
+        } else {
+            printf("  %s(SENSOR DOWN: %s %s)%s\n", red, s->name, how, reset);
+        }
     } else if (!s->have_data) {
         printf("  (waiting for data)\n");
     } else if (age > STALE_AFTER) {
@@ -347,8 +541,17 @@ static void print_report(int ansi)
     printf("%sSensors%s\n", bold, reset);
     for (int i = 0; i < NUM_SENSORS; i++) {
         const struct sensor *s = &sensors[i];
-        printf("  %-12s pid %-7d %-8s via %s\n", s->name, (int)s->pid,
-               s->alive ? "running" : "stopped", s->channel);
+        const char *state = s->alive ? "running"
+                          : s->restart_at > 0 ? "restarting" : "stopped";
+        printf("  %-12s pid %-7d %-10s Restart Count: %-3d via %s\n",
+               s->name, (int)s->pid, state, s->restarts, s->channel);
+    }
+
+    if (log_count > 0) {
+        printf("%sRecovery log%s\n", bold, reset);
+        /* Newest first. */
+        for (int k = 1; k <= log_count; k++)
+            printf("  %s\n", event_log[(log_next - k + LOG_LINES) % LOG_LINES]);
     }
 
     printf(ansi ? "\n(Ctrl+C to quit)\n" : "\n");
@@ -357,13 +560,6 @@ static void print_report(int ansi)
 }
 
 /* ---------- main ---------- */
-
-static long now_ms(void)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
-}
 
 int main(void)
 {
@@ -392,40 +588,23 @@ int main(void)
     }
     made_proc_fifo = 1;
 
-    /* 2. Anonymous pipe for mem_sensor: pipefd[0] = read, pipefd[1] = write. */
-    int pipefd[2];
-    if (pipe(pipefd) != 0) {
-        perror("pipe");
-        ok = 0;
-        goto cleanup;
-    }
-    /* FD_CLOEXEC: the read end closes automatically in any program we
-     * execve(), so no sensor ever holds it by accident. */
-    fcntl(pipefd[0], F_SETFD, FD_CLOEXEC);
-    fcntl(pipefd[0], F_SETFL, O_NONBLOCK);
-    sensors[MEM].fd = pipefd[0];
-
-    char fd_arg[16];
-    snprintf(fd_arg, sizeof(fd_arg), "%d", pipefd[1]);
-    spawn(&sensors[MEM], fd_arg, pipefd[0]);
-
-    /* The parent never writes to the pipe. Closing our write end also means
-     * that when mem_sensor exits, no writer is left and we get end-of-file. */
-    close(pipefd[1]);
-
-    /* 3. The FIFO sensors. pipefd[0] is passed so the children close it. */
-    spawn(&sensors[CPU], NULL, pipefd[0]);
-    spawn(&sensors[PROC], NULL, pipefd[0]);
-
-    /* 4. Open the FIFOs for reading, after every fork so no child inherits
-     * them. O_NONBLOCK matters: a normal open waits until a writer opens the
-     * other end, which would hang forever if a sensor failed to start. */
+    /* 2. Open the FIFOs for reading. They stay open for the whole run, so a
+     * restarted sensor's open(O_WRONLY) finds a reader and returns at once.
+     * O_NONBLOCK: open() doesn't wait for a writer, and read() never blocks.
+     * O_CLOEXEC: sensors started later don't inherit them. */
     sensors[CPU].fd  = open(CPU_FIFO_PATH,  O_RDONLY | O_NONBLOCK | O_CLOEXEC);
     sensors[PROC].fd = open(PROC_FIFO_PATH, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
     if (sensors[CPU].fd < 0 || sensors[PROC].fd < 0) {
         perror("sysmond: open FIFO");
         ok = 0;
         goto cleanup;
+    }
+
+    /* 3. Start the sensors (mem_sensor also gets its anonymous pipe). If
+     * one can't be started, the watchdog tries again later. */
+    for (int i = 0; i < NUM_SENSORS; i++) {
+        if (start_sensor(&sensors[i]) != 0)
+            sensors[i].restart_at = now_ms() + RESTART_MIN_MS;
     }
 
     int ansi = isatty(STDOUT_FILENO);
@@ -439,14 +618,27 @@ int main(void)
     long next_redraw = now_ms() + 300;
 
     while (!stop_requested) {
+        long now = now_ms();
+        long wait = next_redraw - now;
+        int checking = 0;
         struct pollfd pfd[NUM_SENSORS];
+
         for (int i = 0; i < NUM_SENSORS; i++) {
-            pfd[i].fd = sensors[i].fd;    /* poll() skips negative fds */
+            struct sensor *s = &sensors[i];
+            /* Only poll channels with a connected writer. A FIFO with no
+             * writer reports POLLHUP on every call, which would make this
+             * loop spin; those are checked every ATTACH_CHECK_MS instead.
+             * poll() skips negative fds. */
+            pfd[i].fd = (s->fd >= 0 && s->attached) ? s->fd : -1;
             pfd[i].events = POLLIN;
             pfd[i].revents = 0;
+            if (s->fd >= 0 && !s->attached && s->alive)
+                checking = 1;
+            if (s->restart_at > 0 && s->restart_at - now < wait)
+                wait = s->restart_at - now;
         }
-
-        long wait = next_redraw - now_ms();
+        if (checking && wait > ATTACH_CHECK_MS)
+            wait = ATTACH_CHECK_MS;
         if (wait < 0)
             wait = 0;
 
@@ -462,11 +654,16 @@ int main(void)
         /* POLLIN = data waiting. POLLHUP = the writer is gone. Either way,
          * read: it returns the remaining data and then end-of-file. */
         for (int i = 0; i < NUM_SENSORS; i++) {
+            struct sensor *s = &sensors[i];
             if (pfd[i].revents & (POLLIN | POLLHUP | POLLERR))
-                drain_channel(&sensors[i]);
+                check_channel(s);
+            else if (s->fd >= 0 && !s->attached && s->alive)
+                check_channel(s);   /* has the new writer connected yet? */
         }
 
-        reap_sensors();
+        reap_any();
+        if (!stop_requested)
+            restart_due_sensors();
 
         long t = now_ms();
         if (t >= next_redraw) {
